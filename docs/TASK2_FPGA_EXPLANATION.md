@@ -1119,18 +1119,176 @@ works in simulation and in Vivado/Quartus, but the path to the `.mem` files must
 be set by the synthesis project (the package uses `../mem/...`, relative to the
 simulation directory).
 
+# RTL Milestone 5 — One Layer-1 Neuron Engine
+
+Files: `fpga/rtl/pixel_buffer.sv`, `fpga/rtl/l1_neuron_engine.sv`,
+`fpga/scripts/generate_l1_engine_vectors.py`, `fpga/tb/tb_l1_neuron_engine.sv`,
+`fpga/tb/vectors/l1e_images.txt`, `fpga/tb/vectors/l1e_tests.txt`.
+Scope: ONE selected hidden neuron, ending at `current_out` (no LIF, no sweep).
+
+**Pixel buffer.** `pixel_buffer #(WIDTH=8, DEPTH=784, ADDR_WIDTH=10)`: write port
+(`write_enable`, `write_addr`, `write_data`) and a synchronous read port
+(`read_addr`, `read_data <= mem[read_addr]` on `posedge clk`, 1-cycle latency).
+Read-during-write at the same address is not used (the image is loaded before
+`start`) and is not defined. Vendor-neutral inferred memory.
+
+**Engine interface.**
+
+| Port | Dir | Meaning |
+|---|---|---|
+| `clk`, `rst` | in | clock, synchronous active-high reset |
+| `pixel_we`, `pixel_waddr[9:0]`, `pixel_wdata[7:0]` | in | image load port |
+| `start`, `neuron_index[7:0]` | in | `start` accepted only when `busy=0`; index captured at the accepting edge |
+| `busy` | out | high from the accepting edge until the `done` pulse |
+| `done` | out | ONE-clock pulse; `current_out` is final while it is high |
+| `current_out` | out | signed 35 bit (`L1_ACC_WIDTH`) = `l1_mac` accumulator |
+
+A `start` while busy is ignored (tested at the BIAS, LOAD, first RUN, middle and
+DRAIN phases).
+
+**Weight address.** Row-major `[256][784]`, `addr = j*784 + i`, never transposed.
+At the accepting edge the base is computed with no multiplier:
+`j_ext = 18'(neuron_index)` (zero-extended FIRST), `base = (j_ext<<9) + (j_ext<<8) +
+(j_ext<<4)` (784 = 512+256+16), then a running address increments by 1 per pixel.
+Bias address = `neuron_index` (held in a register). Pixel address = `i`.
+
+**States.** `IDLE -> BIAS -> LOAD -> RUN -> DRAIN -> IDLE`.
+
+**Latency alignment.** Both the pixel buffer and the weight ROM register their
+output, so data for an address presented before edge N exists only after edge N.
+The engine issues one address per clock and sets `v1 <= 1` at the same edge where
+the ROMs capture an address. `v1` therefore equals "pixel/weight outputs hold a
+valid pair" and drives `l1_mac.valid` directly, with the pixel, weight and valid
+all one cycle behind the issued address. The bias ROM is read in `BIAS`, so
+`load_bias` (state `LOAD`) happens a clock after the address was presented, when
+the bias is stable on the ROM output.
+
+**Timeline** (E0 = edge that accepts `start`; the ROM address for pixel i is
+captured at E(2+i); the MAC consumes it at E(3+i)):
+
+| Edge | Event |
+|---|---|
+| E0 | start accepted, `nidx`, base weight address, pixel address 0 registered, busy=1 |
+| E1 | bias ROM captures `bias[j]`; state BIAS->LOAD |
+| E2 | `load_bias`: acc <= bias; ROMs capture address 0 (pixel[0], weight[j][0]); v1<=1 |
+| E3 | MAC consumes pixel[0]*weight[j][0] (product 0); ROMs capture address 1 |
+| E4 | product 1 consumed; ROMs capture address 2 |
+| E5 | product 2 consumed |
+| ... | product i consumed at E(3+i) |
+| E784 | ROMs capture address 782 (issue state RUN, last_issue not yet true); product 781 consumed |
+| E785 | ROMs capture address 783 (`last_issue`), RUN->DRAIN; product 782 consumed |
+| E786 | MAC consumes product 783; `acc_out` final after this edge; `done<=1`, DRAIN->IDLE, busy=0 |
+
+(For index i: address 0 issued with E2, 1 with E3, 2 with E4, 782 with E784, 783
+with E785; products are accumulated one edge later.) The pixel/weight pair read
+at E(2+i) is the pair consumed at E(3+i), so product i uses `pixel[i]` and
+`weight[j][i]`, each index exactly once.
+
+**Final product / drain.** Address 783 is issued at E785; pixel[783]/weight[783]
+appear after E785; `l1_mac` consumes them at E786; `acc_out` includes product 783
+right after E786, which is also when `done` rises (registered at the same edge).
+`done` is a one-clock pulse, so the consumer sees `done=1` and the final
+`current_out` in the same cycle.
+
+**Exact cycle count (measured).** Accepted-start edge to done = **786 clocks** =
+1 (bias ROM) + 1 (bias load) + 784 (one MAC product per clock; the address issue
+and ROM latency are overlapped with the products, so no extra bubbles). The
+measured latency was 786 for every one of 590 runs.
+
+**Diagram.**
+
+```
+        neuron_index
+             |
+     +-------+---------+
+     |                 |
+     v                 v
+ bias_addr      weight_base = j*784 = (j<<9)+(j<<8)+(j<<4)
+     |                 |
+     v                 + input_index i (running counter, +1 per pixel)
+ L1 bias ROM           |
+     |                 v
+     |            L1 weight ROM        pixel_buffer <- image load port
+     |                 |                    |
+     |               weight             pixel[i]
+     |                 |                    |
+     +------> l1_mac <-+--------------------+      (valid delayed by v1)
+                 |
+                 v
+            current_out (35 bit)
+```
+
+**Golden vectors.** `generate_l1_engine_vectors.py` uses real MNIST test images
+(raw bytes, asserted equal to `round(float*255)`), the exported weights/biases,
+and `pixels.astype(int64) @ weights1[j].astype(int64) + bias1[j]`, cross-checked
+against the layer-1 current Int16SNN actually feeds to the LIF (8 images x 256
+neurons identical). 583 tests on 10 images (8 real + all-zero + all-255): ALL 256
+neurons for images 0 and 1 (every row boundary), neurons 0, 1, 2, 127, 128, 254,
+255 plus the maximum- and minimum-current neurons for every image.
+
+**Testbench.** Pixel-buffer test (first/last address, latency, two full real
+images read back byte by byte); reset; idle; every vector; start-while-busy at six
+phases; reset in the middle of a computation followed by a good run. A monitor on
+the falling edge checks, for EVERY one of the 784 MAC valid cycles of every run:
+pixel address = i, weight address = `j*784+i`, pixel and weight data equal the
+expected values for that same i, no extra/illegal valid, the bias at `load_bias`
+equals the bias ROM entry; plus: exactly 784 products per run, exactly one `done`
+pulse, latency = 786, `current_out` correct when `done=1` and stable afterwards.
+It also recomputes every expected current from the reference arrays inside the
+testbench (independent of the file value).
+
+**ModelSim results (actually run, Intel FPGA Edition 10.5b).**
+
+```
+cd fpga\tb
+vlog -sv ..\rtl\snn_params_pkg.sv ..\rtl\sync_rom.sv ..\rtl\pixel_buffer.sv ^
+         ..\rtl\l1_mac.sv ..\rtl\l1_neuron_engine.sv tb_l1_neuron_engine.sv
+vsim -c work.tb_l1_neuron_engine -do "run -all; quit -f"
+  pixel-buffer reads checked    : 1574   mismatches 0
+  neuron-current tests          : 590 (583 file + 6 busy-ignore + 1 after mid-run reset)
+  complete 784-product runs     : 590
+  MAC products verified         : 462,560 (= 590 x 784), extra/illegal valid 0
+  address/data alignment checks : 462,560  failures 0
+  bias-load alignment checks    : 590
+  accepted-start -> done        : 786 clocks (min 786, max 786)
+  total failures                : 0     PASS
+```
+
+**Intentional breaks** (temporary mutants, deleted, never committed):
+
+| Break | Failures detected |
+|---|---|
+| weight address off by one | 463,694 |
+| pixel address off by one | 74,567 |
+| no valid delay for the synchronous ROM | 461,988 |
+| only 783 products | 1,198 |
+| 785 products | 2,360 |
+| `done` one cycle early | 2,369 |
+| wrong neuron base address (`j<<3` instead of `j<<4`) | 455,078 |
+| wrong bias neuron | 1,770 |
+| weight treated as unsigned (in `l1_mac`) | 1,160 |
+
+**Notes.** Single-stage MAC and pixel/weight memories are inferred; nothing is
+synthesised yet. The pixel RAM, weight ROM and `l1_mac` are not yet optimised for
+a target device.
+
 # Open Items (to resolve before RTL)
 
-1. Target FPGA device and BRAM capacity (~100 RAMB36 needed).
-2. On-board image input interface (UART / SPI / ROM) undecided.
-3. Generic-safe vs proven (tight) widths.
-4. Thresholds must be exported from `Int16SNN`, not recomputed.
-5. **Confirm the cached-L1-current schedule** (deviates from the literal
-   "recompute every step"; numerically identical).
-6. Timing of the shift/add decay pipeline (3-4 stages, 42-bit adders) vs the
-   clock target; the 6-DSP reciprocal multiplier remains an alternative.
-7. Simulator choice (XSim, Verilator, Questa).
-8. Beta is hard-coded as 19/20.
-9. Add an argmax tie test vector.
+1. Target FPGA device and BRAM capacity (~100 RAMB36 needed). **Open.**
+2. On-board image input interface (UART / SPI / ROM) undecided. **Open.**
+3. Generic-safe widths are the current reference implementation; tight-width
+   optimisation (proven 31/21-bit accumulators etc.) is a future optimisation,
+   not a correctness issue. **Deferred.**
+4. Thresholds are exported from `Int16SNN` into `snn_params_pkg.sv`. **Resolved
+   (Milestone 4).**
+5. The cached-L1-current schedule is numerically identical to recomputing at each
+   step (verified t=0..24 on 20 images x 256 neurons). **Resolved (Milestone 3);**
+   a user decision on the schedule itself remains welcome.
+6. Synthesis / timing / pipelining of `decay_19_20`, `lif_core`, `l1_mac` and the
+   memories (shift/add decay needs 3-4 stages; the multiply-add must be
+   DSP-pipelined). **Open.**
+7. Simulator: ModelSim is the current simulator. **Resolved.**
+8. Beta is hard-coded as 19/20. Accepted.
+9. Add an argmax tie test vector. **Open.**
 10. (Resolved) The repository reorganization and the LIF correction are on `origin/main`.
 
