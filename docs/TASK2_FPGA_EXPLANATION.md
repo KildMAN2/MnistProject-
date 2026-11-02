@@ -661,6 +661,146 @@ compares, 5q, subtract, increment, negate) of up to ~43 bits, so it will not
 meet a high clock rate unpipelined; pipelining at the x, q6, fix-up and
 rounding boundaries is planned.
 
+# RTL Milestone 2 — Bit-Exact LIF Core
+
+Files: `fpga/rtl/lif_core.sv`, `fpga/tb/tb_lif_core.sv`,
+`fpga/scripts/generate_lif_vectors.py`,
+`fpga/tb/vectors/lif_l1_vectors.txt`, `fpga/tb/vectors/lif_l2_vectors.txt`.
+
+**Interface.** Purely combinational and stateless (the membrane storage will
+belong to higher-level logic):
+
+```systemverilog
+module lif_core #(
+    parameter int     MEM_WIDTH = 38,
+    parameter int     CUR_WIDTH = 35,
+    parameter longint THRESHOLD = 37718198
+) (
+    input  logic signed [MEM_WIDTH-1:0] membrane_in,   // stored membrane
+    input  logic signed [CUR_WIDTH-1:0] current_in,    // layer current (incl. bias)
+    output logic signed [MEM_WIDTH-1:0] membrane_out,  // value to store
+    output logic                        spike_out);
+```
+
+| | MEM_WIDTH | CUR_WIDTH | THRESHOLD |
+|---|---|---|---|
+| Layer 1 | 38 | 35 | 37,718,198 (`Int16SNN.threshold1`) |
+| Layer 2 | 36 | 33 | 164,691 (`Int16SNN.threshold2`) |
+
+Elaboration checks (`$fatal`): `CUR_WIDTH <= MEM_WIDTH`, and `0 < THRESHOLD <
+2^(MEM_WIDTH-1)`. The threshold is an explicit signed MEM_WIDTH constant
+(`THR`), and `current_in` is explicitly sign-extended by replicating its sign
+bit (a generate branch handles the equal-width case).
+
+**Equations (all comparisons strict `>`).**
+
+```
+prev_reset   = membrane_in > THR            // STORED membrane, not decayed/base
+decayed      = decay_19_20(membrane_in)     // verified milestone-1 block, instantiated
+base         = decayed + sext(current_in)
+pre_spike    = base - (prev_reset ? THR : 0)
+spike_out    = pre_spike > THR
+membrane_out = base - (spike_out ? THR : 0)
+```
+
+**Algebraic simplification.** Python: `mem_new = pre_spike - (spike -
+prev_reset)*thr`. Substituting `pre_spike = base - prev_reset*thr` gives
+`mem_new = base - prev_reset*thr - spike*thr + prev_reset*thr = base -
+spike*thr`. Only the final update simplifies; `prev_reset` is still required
+in `pre_spike` before the spike comparison.
+
+**Width handling.** `decayed`, `base`, `pre_spike`, `membrane_out` are signed
+MEM_WIDTH. The Arithmetic Width Analysis shows they fit for every reachable
+membrane/current (generic-safe L1 38/35, L2 36/33). The core does not
+saturate; stored membranes and currents outside the analysed range can wrap,
+which is why the generated vectors exclude them (see below).
+
+**Block diagram**
+
+```
+                 +---------------+
+membrane ------->| decay_19_20   |--> decayed
+    |            +---------------+
+    |
+    +--> [mem > threshold] --> prev_reset
+
+decayed --+
+           +--> base = decayed + current
+current --+
+                 |
+                 +-- subtract threshold if prev_reset
+                 |
+                 v
+             pre_spike
+                 |
+                 v
+       [pre_spike > threshold]
+                 |
+                 v
+               spike
+
+base -- subtract threshold if spike --> membrane_new
+```
+
+**Vector generation.** `py -m fpga.scripts.generate_lif_vectors` uses the real
+`Int16SNN._lif_step` as the oracle and writes
+`membrane_in current_in expected_membrane_out expected_spike` as fixed-width
+two's-complement hex. Coverage per layer: membrane = 0 / thr-1 / thr / thr+1,
+current 0, `pre_spike` targets thr-2 ... thr+2 with `prev_reset` both 0 and 1,
+positive and negative currents and membranes, decay ties
+(`|m| = 20t+10`), the extreme values of both ranges, 20,000+ random vectors
+per layer in several distributions (full range, +-3 thr, +-8 thr, narrow
+band around thr). Candidates whose reference intermediates (`base`,
+`pre_spike`, `membrane_new`) would leave the signed MEM_WIDTH range are
+excluded (350 for L1, 316 for L2), since int64 Python would not wrap but
+hardware would; the width analysis shows these are unreachable.
+
+| | Vectors | prev_reset=1 / 0 | Spikes / no spike | `pre_spike` = thr-1 / thr / thr+1 | Ties |
+|---|---|---|---|---|---|
+| Layer 1 | 95,380 | 40,437 / 54,943 | 33,807 / 61,573 | 60 / 61 / 60 | 5,145 |
+| Layer 2 | 95,414 | 40,562 / 54,852 | 33,884 / 61,530 | 59 / 60 / 59 | 5,154 |
+
+**Regression test (the earlier architecture bug).** `tb_lif_core` also
+instantiates `lif_core` with THRESHOLD=100 (MEM 16, CUR 12) and checks
+membrane=120, current=50: `decayed=114, prev_reset=1, base=164,
+pre_spike=64, spike=0, membrane_new=164`. The rejected form without
+`prev_reset` would give spike=1. Directed cases also check the strict
+comparison on the stored membrane (100 -> no reset, 101 -> reset) and on
+`pre_spike` (99, 100 -> no spike; 101 -> spike), with and without
+`prev_reset`.
+
+**Testbench.** `tb_lif_layer` (one layer, parameterised, reads one vector
+file) is instantiated twice by `tb_lif_core`; on a mismatch it prints index,
+inputs (decimal and hex), expected and actual membrane/spike, the threshold
+and the DUT internals `decayed`, `prev_reset`, `base`, `pre_spike`
+(hierarchical references; the production interface is unchanged). The top
+testbench ends in `PASS` or `$fatal`.
+
+**ModelSim results (actually run, ModelSim - Intel FPGA Edition 10.5b).**
+
+```
+cd fpga\tb
+vlib work
+vlog -sv ..\rtl\decay_19_20.sv ..\rtl\lif_core.sv tb_lif_core.sv
+vsim -c work.tb_lif_core -do "run -all; quit -f"
+  Layer 1 (MEM=38 CUR=35 THR=37718198): tests = 95380  failures = 0
+  Layer 2 (MEM=36 CUR=33 THR=164691)  : tests = 95414  failures = 0
+  Regression (THR=100)                : failures = 0
+  PASS: tb_lif_core
+```
+
+Compile: 0 errors, 0 warnings.
+
+**Intentional-break checks** (temporary mutants, deleted, never committed):
+
+| Mutation | L1 failures | L2 failures | Regression failures |
+|---|---|---|---|
+| `spike = pre_spike >= THR` | 61 | 60 | 2 |
+| `prev_reset = membrane >= THR` | 7 | 7 | 1 |
+| spike decided without `prev_reset` (`decayed+current > THR`) | 4,044 | 4,087 | 3 |
+
+All three were detected.
+
 # Open Items (to resolve before RTL)
 
 1. Target FPGA device and BRAM capacity (~100 RAMB36 needed).
