@@ -173,6 +173,53 @@ Top interface: pixel write port (`addr[9:0]`, `data[7:0]`, `we`), `start`,
 
 # Datapath
 
+## Pixel x weight: explicit signedness
+
+Decision: the pixel is stored as `logic [7:0] pixel_u` (raw MNIST byte,
+unsigned 0..255) and converted to a **signed 9-bit** operand by prepending a
+zero: `logic signed [8:0] pixel_s = {1'b0, pixel_u};`. The weight is
+`logic signed [15:0] weight_s` (two's complement int16, read from the `.mem`
+file). The product is
+
+```
+logic signed [23:0] product_s;
+product_s = pixel_s * weight_s;          // both operands signed, result 24 bit
+```
+
+**Range proof.** pixel in [0, 255], weight in [-32768, 32767]:
+
+- minimum = 255 x (-32768) = -8,355,840
+- maximum = 255 x 32767 = +8,355,585
+- signed 24-bit range = [-8,388,608, +8,388,607], so every product fits
+  (|min| < 2^23 = 8,388,608). 23 bits would be too small for the sign, so
+  **24 signed bits is the minimum**. (Exported weights actually span
+  [-32767, 30834], a subset.)
+
+**Why `{1'b0, pixel_u}` and not a bare 8-bit operand.** In SystemVerilog a
+multiplication is signed only if *all* operands are signed. If `pixel_u`
+(unsigned) is mixed with a signed weight, the expression is evaluated as
+unsigned: the weight is zero-extended, so a negative weight such as -1
+(`16'hFFFF`) becomes +65535 and the product is wrong. With both operands
+declared `signed`, the narrower operand is sign-extended to the context width
+(24 bits for the assignment), so a negative weight is extended correctly. A
+9-bit signed pixel with a leading 0 stays non-negative (0..255), so
+sign-extension adds only zeros. Never use `$signed(pixel_u)` on the 8-bit
+value: `8'd200` would become -56. The only safe forms are
+`$signed({1'b0, pixel_u})` or the declared `pixel_s` above. Likewise the
+accumulator must be declared `logic signed [34:0] acc` (generic-safe) and the
+product is added as-is (`acc <= acc + product_s;` with `product_s` signed, so
+it is sign-extended to 35 bits); bias is `logic signed [31:0]`.
+
+Layer 2 has no multiplier: `acc2 <= acc2 + (spike ? weight_s : 16'sd0);` -
+`weight_s` is signed, so it is sign-extended into the signed accumulator.
+
+Final types: pixel `logic signed [8:0]` (from the unsigned 8-bit byte,
+0..255), weight `logic signed [15:0]`, product `logic signed [23:0]`. Verified
+numerically: the min/max products above were computed from the full
+operand extremes, and the exported weight dtype is int16 with min/max
+-32767/30834.
+
+## Layer equations
 Layer 1 (per image, per neuron j): `ACC1[j] = b1[j] + sum_i pixel[i]*W1[j][i]`
 (784 MAC cycles + 3 pipeline cycles: BRAM read, product register,
 accumulator register). Result stored in the `cur1` RAM.
@@ -356,16 +403,22 @@ Overall DSP budget: **1 (L1 MAC) with option D**, or 7 (1 + 6) with option A
 ## Verification Results (Python equivalence of the hardware equations)
 
 `py -m fpga.scripts.lif_equiv_check` compares `hw_lif` against
-`Int16SNN._lif_step` bit-for-bit (membrane and spike):
+`Int16SNN._lif_step` bit-for-bit (membrane and spike). **Correction:** an
+earlier revision of the script accepted a `decay` argument but `hw_lif`
+always called the reciprocal `hw_decay`, so the "shift/add full-LIF" result
+did not actually exercise the shift/add decay. `hw_lif` now takes a required
+`decay_function`; the harness wraps it with a call counter and asserts it was
+invoked once per vector, and a deliberately wrong (sabotaged) decay is
+confirmed to be detected. Both decay implementations are now run through the
+full LIF on the same vectors:
 
-| Test set | Vectors | Mismatches |
-|---|---|---|
-| Layer-1 threshold 37,718,198 | 400,282 | **0** |
-| Layer-2 threshold 164,691 | 400,282 | **0** |
-| thr = 12,345 | 400,282 | **0** |
-| thr = 1 | 400,282 | **0** |
-| Shift/add decay vs reference rounding (ties, +-2^k edges, random to 2^38) | 410,222 | **0** |
-| Full LIF with shift/add decay, L1 / L2 / thr=1 | 3 x 150,000 | **0** |
+| Test set (same vectors for both decays) | Vectors | Mismatches, reciprocal decay | Mismatches, shift/add decay |
+|---|---|---|---|
+| Layer-1 threshold 37,718,198 | 400,282 | **0** | **0** |
+| Layer-2 threshold 164,691 | 400,282 | **0** | **0** |
+| thr = 12,345 | 400,282 | **0** | **0** |
+| thr = 1 | 400,282 | **0** | **0** |
+| Decay alone, shift/add vs reference rounding (ties, +-2^k edges, random to 2^38) | 410,222 | - | **0** |
 
 Vectors cover positive and negative membranes, mem == thr, thr-1, thr+1, 2thr,
 `pre_spike` exactly at thr-1 / thr / thr+1 with `pr = 1`, positive and negative

@@ -47,13 +47,10 @@ def hw_decay_shiftadd(m: int) -> int:
     return -mag if m < 0 else mag
 
 
-MAX_R4 = [0]
-
-
-def hw_lif(m: int, cur: int, thr: int, decay=None) -> tuple[int, int]:
+def hw_lif(m: int, cur: int, thr: int, decay_function) -> tuple[int, int]:
     """Hardware equations, strict '>' comparisons, previous_reset kept."""
     prev_reset = m > thr
-    decayed = hw_decay(m)
+    decayed = decay_function(m)
     base = decayed + cur
     pre_spike = base - (thr if prev_reset else 0)
     spike = pre_spike > thr
@@ -89,6 +86,18 @@ def vectors(thr: int, rng: np.random.Generator, n_random: int, cur_lim: int):
     return pairs
 
 
+DECAYS = {"reciprocal": hw_decay, "shift/add": hw_decay_shiftadd}
+calls = [0]
+
+
+def counted(fn):
+    def wrapper(v: int) -> int:
+        calls[0] += 1
+        return fn(v)
+
+    return wrapper
+
+
 def main() -> None:
     model = Int16SNN(INT16_DIR)
     rng = np.random.default_rng(20260211)
@@ -103,10 +112,15 @@ def main() -> None:
         m = np.array([p[0] for p in pairs], dtype=np.int64)
         c = np.array([p[1] for p in pairs], dtype=np.int64)
         ref_m, ref_s = Int16SNN._lif_step(m, c, int(thr))
-        hw = [hw_lif(int(a), int(b), int(thr)) for a, b in zip(m, c)]
-        hw_m = np.array([h[0] for h in hw], dtype=np.int64)
-        hw_s = np.array([h[1] for h in hw], dtype=np.uint8)
-        bad = int((hw_m != ref_m).sum() + (hw_s != ref_s).sum())
+        bads = {}
+        for dname, dfn in DECAYS.items():
+            calls[0] = 0
+            hw = [hw_lif(int(a), int(b), int(thr), counted(dfn)) for a, b in zip(m, c)]
+            assert calls[0] == len(pairs), "decay function was not used by hw_lif"
+            hw_m = np.array([h[0] for h in hw], dtype=np.int64)
+            hw_s = np.array([h[1] for h in hw], dtype=np.uint8)
+            bads[dname] = int((hw_m != ref_m).sum() + (hw_s != ref_s).sum())
+        bad = sum(bads.values())
         wrong = sum(
             wrong_simplified(int(a), int(b), int(thr)) != int(s)
             for a, b, s in zip(m, c, ref_s)
@@ -119,7 +133,7 @@ def main() -> None:
             "no-spikes": int((ref_s == 0).sum()),
         }
         print(f"{name:10s} thr={thr:>10d} vectors={len(pairs):7d} "
-              f"mismatches={bad} | rejected-form spike errors={wrong} | {cat}")
+              f"mismatches={bads} | rejected-form spike errors={wrong} | {cat}")
         total_mismatch += bad
     # shift/add decay (no DSP): exhaustive-style check against the reference rounding
     from software.quantization.quantization import _round_ratio_ties_to_even
@@ -131,16 +145,16 @@ def main() -> None:
     bad_d = sum(hw_decay_shiftadd(v) != int(r) for v, r in zip(dm, ref))
     print(f"shift/add decay: cases={len(dm)} mismatches={bad_d}")
     total_mismatch += bad_d
-    for name, thr in (("layer1", model.threshold1), ("layer2", model.threshold2), ("thr=1", 1)):
-        m = rng.integers(-(1 << 37), 1 << 37, 150_000)
-        c = rng.integers(-(1 << 33), 1 << 33, 150_000)
-        rm, rs = Int16SNN._lif_step(m, c, int(thr))
-        bad = sum(
-            hw_lif(int(a), int(b), int(thr), hw_decay_shiftadd) != (int(x), int(y))
-            for a, b, x, y in zip(m, c, rm, rs)
-        )
-        print(f"shift/add LIF {name}: mismatches={bad}")
-        total_mismatch += bad
+    # sanity: the harness must detect a wrong decay inside the LIF datapath
+    def sabotaged(v: int) -> int:
+        return hw_decay(v) + (1 if v == 10 else 0)
+
+    m = np.array([10, 5], dtype=np.int64)
+    c = np.array([0, 0], dtype=np.int64)
+    rm, _ = Int16SNN._lif_step(m, c, 1000)
+    detected = hw_lif(10, 0, 1000, sabotaged)[0] != int(rm[0])
+    print(f"sabotaged-decay detection (must be True): {detected}")
+    assert detected
     print("TOTAL MISMATCHES:", total_mismatch)
     raise SystemExit(1 if total_mismatch else 0)
 
