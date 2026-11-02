@@ -1438,6 +1438,142 @@ single-stage multiply-add. About 201k clocks per image for layer 1 dominates the
 total (see Schedule). Nothing is synthesised, so timing, DSP and block RAM mapping
 remain open.
 
+# RTL Milestone 7 — Layer-1 LIF Sweep
+
+Files: `fpga/rtl/mem1_ram.sv`, `fpga/rtl/l1_lif_sweep.sv`,
+`fpga/scripts/generate_l1_lif_vectors.py`, `fpga/tb/tb_l1_lif_sweep.sv`.
+
+`l1_lif_sweep` performs ONE layer-1 LIF time step over all 256 hidden neurons, in
+order j = 0..255. It reuses the verified `lif_core` unchanged (no duplicated
+arithmetic), reads the cached current `cur1[j]` through `cur1_raddr/cur1_rdata`
+(owned by `l1_current_sweep`, interpreted with `$signed`), reads the persistent
+membrane `mem1[j]`, and writes back `mem1[j] <= membrane_new` and
+`hidden_spikes[j] <= spike`.
+
+```
+ cur1 cache (owned by l1_current_sweep)           mem1_ram 256 x 38
+   ^ cur1_raddr = nidx          cur1_rdata (35)     ^ raddr = nidx    | waddr = nidx
+   |                                 |              |                 | wdata
+   |                                 v              | mem_rdata (38)  |
+ +---------------------------------------------------------------------------+
+ |  controller: IDLE / CLEAR / ISSUE / UPD, nidx 0..255                       |
+ |                lif_core(membrane_in = mem_rdata, current_in = cur1_rdata)  |
+ |  UPD: mem1[nidx] <= membrane_out ; hidden_spikes[nidx] <= spike_out        |
+ +---------------------------------------------------------------------------+
+        step_done (registered pulse), clear_done, busy, hidden_spikes[255:0]
+```
+
+## Interface and behaviour
+
+| Port | Meaning |
+|---|---|
+| `clear_state` / `clear_done` | pulse in / registered 1-clock pulse out; writes mem1[0..255] = 0 |
+| `start_step` / `step_done` | pulse in / registered 1-clock pulse out; one LIF step |
+| `busy` | high from the accepting edge until `clear_done` / `step_done` |
+| `cur1_raddr[7:0]`, `cur1_rdata[34:0]` | synchronous cur1 cache read |
+| `hidden_spikes[255:0]` | spikes of the last completed step (cleared by reset / clear) |
+
+- Commands arriving while busy are ignored; if `clear_state` and `start_step` arrive
+  together while idle, `clear_state` wins.
+- **Reset resets the controller and `hidden_spikes` only.** `mem1` is an inferred
+  RAM with no reset loop, so its contents are undefined at power-up and NOT cleared
+  by reset. The top level must issue `clear_state` before the first step of every
+  image (membranes persist between steps; they are cleared once per image only).
+- mem1 debug path: the testbench reads `dut.u_mem1.mem[j]` hierarchically; the
+  RAM also has a synchronous read port.
+
+## Clock-by-clock timeline (E0 = edge accepting `start_step`)
+
+Two clocks per neuron (ISSUE then UPDATE); the sequencing is simple enough to prove
+by inspection. The old `nidx` is used by the write in UPD while `nidx` advances.
+
+| Edge | state before edge | nidx | what happens at this edge |
+|---|---|---|---|
+| E0 | IDLE | – | `start_step` accepted, nidx <= 0, state <= ISSUE |
+| E1 | ISSUE | 0 | RAMs capture address 0 (cur1 and mem1) |
+| E2 | UPD | 0 | cur1[0], mem1[0] valid on RAM outputs, `lif_core` combinational; mem1[0] <= new, spike[0] <= spike, nidx <= 1 |
+| E3 | ISSUE | 1 | RAMs capture address 1 |
+| E4 | UPD | 1 | write neuron 1 |
+| … | | | neuron j: address captured at E(2j+1), written at E(2j+2) |
+| E509 | ISSUE | 254 | RAMs capture address 254 |
+| E510 | UPD | 254 | write neuron 254 |
+| E511 | ISSUE | 255 | RAMs capture address 255 |
+| E512 | UPD | 255 | write neuron 255; `step_done` registered at the same edge; state <= IDLE |
+
+`step_done` is therefore visible after E512 = **512 clocks** after the accepting edge,
+when mem1[255] and `hidden_spikes[255]` are already updated. The old membrane is
+always the stored value from the previous step (read before write; the new value is
+never fed back into the same update).
+
+Clear: E0 accepts; edge E(j+1) writes mem1[j] = 0; E256 writes mem1[255] and
+registers `clear_done` => **256 clocks**.
+
+## Persistence across the 25 time steps
+
+```
+clear_state -> mem1 = 0
+step 0 : mem1_in = 0          -> mem1 = f(0, cur)       (cur static, cached)
+step 1 : mem1_in = mem1(step0) -> mem1 = f(...)
+...
+step 24: mem1_in = mem1(step23)
+(next image: pixels -> current sweep -> clear_state -> 25 steps)
+```
+
+## Golden vectors
+
+`generate_l1_lif_vectors.py` runs the REAL `Int16SNN._lif_step` with the real integer
+layer-1 threshold for t = 0..24 on MNIST test image 0, test image 1, an all-zero image
+and an all-255 image, exports `membrane_in[256]`, `membrane_out[256]` and `spikes[256]`
+per step, and cross-checks every one of them against the layer-1 values actually seen
+inside the real `Int16SNN.__call__` forward pass (4 x 25 x 256 equal). Spikes over 25
+steps: 589, 633, 0, 702. It also exports 1,024 directed (membrane, current) cases
+produced with the real `_lif_step`: membrane at threshold-1/threshold/+1, pre-spike
+exactly at threshold-1/threshold/threshold+1, negative and positive membrane/current,
+prev_reset 0 and 1 (229 cases), spike 0/1, and 369 decay tie cases.
+
+## ModelSim result (Intel FPGA Edition 10.5b)
+
+`tb_l1_lif_sweep` wires `l1_current_sweep` and `l1_lif_sweep` through the real cache
+path (image -> current sweep -> clear -> 25 steps) and checks every step.
+
+| Check | Count | Failures |
+|---|---|---|
+| Images run (4 + image 0 repeated after a mid-step reset) | 5 | 0 |
+| LIF time steps | 125 | 0 |
+| Neuron LIF updates (the 4 required images = 25,600) | 32,000 | 0 |
+| Membrane comparisons / spike comparisons | 32,000 / 32,000 | 0 |
+| membrane_in and cur1 value checks at update time | 32,000 / 32,000 | 0 |
+| Neuron order 0..255 (no skip, no duplicate) | 32,000 | 0 |
+| Per-step 256 writes, one `step_done` | 125 | 0 |
+| `step_done` only after the last write | 125 | 0 |
+| Clears: 256 zero writes each, all zero afterwards | 5 | 0 |
+| Latency (clear 256, step 512, current sweep 201,473) – measured | 135 | 0 |
+| Busy / commands ignored while busy | 64,130 / 8 | 0 |
+| Reset (idle, spikes cleared, mem1 NOT cleared) | 6 | 0 |
+| Directed integration cases | 1,024 | 0 |
+
+Total failures: 0. Measured latencies: clear 256, one step 512.
+
+### Intentional breaks (all caught, then removed)
+
+| # | Mutant | Failures |
+|---|---|---|
+| 1 | cur1 address off by one | 136,918 |
+| 2 | mem1 read address off by one | 97,991 |
+| 3 | current sign bit dropped (unsigned) | 109,356 |
+| 4 | membrane sign bit dropped (unsigned) | 118,197 |
+| 5 | membrane written to j+1 | 68,817 |
+| 6 | spike written to j+1 | 4,910 |
+| 7 | neuron 128 skipped | 16,409 |
+| 8 | neuron 127 processed twice | 206 |
+| 9 | clear writes only 255 words | 645 |
+| 10 | membrane zero at every step | 93,970 |
+| 11 | `step_done` one cycle early | 504 |
+| 12 | `>=` instead of `>` in `lif_core` (mutated copy) | 32 |
+
+(A first version of mutant 8 left its state flag uninitialised, made no change and
+passed; it was corrected and then caught.)
+
 # Open Items (to resolve before RTL)
 
 1. Target FPGA device and BRAM capacity (~100 RAMB36 needed). **Open.**
