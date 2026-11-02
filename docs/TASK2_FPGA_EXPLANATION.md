@@ -801,6 +801,177 @@ Compile: 0 errors, 0 warnings.
 
 All three were detected.
 
+# RTL Milestone 3 — Layer-1 MAC
+
+Files: `fpga/rtl/l1_mac.sv`, `fpga/tb/tb_l1_mac.sv`,
+`fpga/scripts/generate_mac_vectors.py`,
+`fpga/tb/vectors/mac_prim_vectors.txt`, `fpga/tb/vectors/mac_neuron_vectors.txt`.
+
+**Why 784 products per hidden neuron.** Every hidden neuron is connected to
+all 28 x 28 = 784 input pixels, so one neuron's current is
+`current[j] = bias1[j] + sum_{i=0..783} pixel[i] * weight1[j][i]`. `l1_mac`
+computes this for ONE neuron, one pixel/weight pair per clock.
+
+**Interface.**
+
+```systemverilog
+module l1_mac #(parameter int ACC_WIDTH = 35) (
+    input  logic                        clk,
+    input  logic                        rst,        // synchronous, active high
+    input  logic                        load_bias,  // start a neuron: acc <= bias
+    input  logic signed [31:0]          bias,
+    input  logic                        valid,      // accumulate pixel*weight this clock
+    input  logic        [7:0]           pixel,
+    input  logic signed [15:0]          weight,
+    output logic signed [ACC_WIDTH-1:0] acc_out,    // accumulator register
+    output logic                        result_valid);
+```
+
+The MAC owns only its accumulator. **It has no 784 counter**: the future
+controller owns `input_index 0..783`, so the MAC stays reusable and
+independently testable (it only reacts to `load_bias` and `valid`). Priority:
+`rst` > `load_bias` > `valid`; with neither, the accumulator holds.
+
+**Numeric types (all explicit).**
+
+| Signal | Type | Range |
+|---|---|---|
+| `pixel` | `logic [7:0]` | 0 ... 255 |
+| `pixel_s` | `logic signed [8:0]` = `{1'b0, pixel}` | 0 ... 255 |
+| `weight` | `logic signed [15:0]` | -32768 ... 32767 |
+| `product` | `logic signed [23:0]` | -8,355,840 ... 8,355,585 |
+| `bias` | `logic signed [31:0]` | int32 |
+| `acc_out` | `logic signed [34:0]` | worst case -8,698,462,208 ... 8,698,262,287 |
+
+Product range proof: `255 * -32768 = -8,355,840`, `255 * 32767 = 8,355,585`,
+both inside the signed 24-bit range +-8,388,608. Accumulator: 784 products
+reach at most +-6,550,978,560, plus a 32-bit bias gives +-8.70e9, which
+needs 35 signed bits (limit +-17.18e9).
+
+**Explicit sign extension.** Both multiplier operands are declared signed, so
+SystemVerilog sign-extends the 9-bit pixel and the 16-bit weight to the
+24-bit result; the pixel's leading 0 keeps it non-negative. The 24-bit
+product and the 32-bit bias are sign-extended to 35 bits by replicating their
+sign bits (`{{11{product[23]}}, product}`, `{{3{bias[31]}}, bias}`), never by
+implicit rules. There is no saturation: arithmetic is exact within the
+proven width.
+
+**Accumulation convention (bias first).**
+
+```
+load_bias:  acc <= sext(bias)
+valid:      acc <= acc + sext(pixel_s * weight)       (784 times)
+```
+
+After the clock edge that accumulates the 784th product, `acc_out =
+bias + sum(products)`. Loading the bias first needs no extra adder at the end
+and is mathematically identical to adding it last (no intermediate overflow
+within 35 bits; the testbench checks the running value).
+
+**Diagram**
+
+```
+ bias (int32)
+     |
+ sign extend
+     |
+     v
+ accumulator register <------------------------+
+     ^                                         |
+     |                                         |
+     +----- sign-extended 24-bit product ------+
+                         ^
+                         |
+                signed multiplication
+                  /             \
+          pixel 9-bit        weight int16
+          0..255             signed
+```
+
+**Clock semantics.** `acc_out` is a register updated with nonblocking
+assignments, so right at the edge a testbench still reads the OLD value; the
+new value exists only after the edge's NBA region. The testbench applies
+stimulus 1 ns after an edge and samples 1 ns after the next edge.
+`result_valid` is a registered "an accumulate happened at the previous edge",
+so after the final product's edge `result_valid = 1` and `acc_out` already
+holds the final current. In the 784-cycle neuron the controller simply waits
+one cycle after the last pair.
+
+**Numerical example.** bias = 100; pairs (pixel, weight) = (200, -3),
+(255, 32767), (0, -32768): acc = 100, then 100 - 600 = -500, then
+-500 + 8,355,585 = 8,355,085, then unchanged = 8,355,085. A pixel of 200
+treated as signed 8-bit (-56) or a weight -1 treated as unsigned (65,535)
+would give a wrong result (both are tested below).
+
+**Current caching.** `generate_mac_vectors.py` verifies against the real
+`Int16SNN`: it spies on `Int16SNN._lif_step` and captures the layer-1 current
+fed to the LIF at every one of the 25 time steps for 20 MNIST images x 256
+neurons. The current is identical for t = 0 ... 24 and equals
+`pixels @ W1.T + b1`. The image and bias do not change with time, so the
+layer-1 current can be computed once per image and cached; this is a
+scheduling optimisation only and does not change any value.
+
+**Vector generation.** The oracle is the exported
+`layer1_weights_int16.npy` / `layer1_bias_int32.npy` with real MNIST test
+pixels (raw bytes; verified identical to the reference's `rint(x*255)`) and
+int64 arithmetic.
+
+- Primitive (20,129): the required examples (0*-32768, 1*-1, 200*-1,
+  255*-32768 = -8,355,840, 255*32767 = 8,355,585), a 9 x 13 grid of edge
+  pixels/weights, and 20,000 random pairs.
+- Complete neuron (84 tests x 784 products): image 0..7 x neurons 0, 1, 2,
+  127, 128, 255 plus per image the neurons with the largest and smallest
+  current, the most positive weights and the most negative weights; all-zero
+  and all-255 images; two synthetic worst cases (all pixels 255 with weights
+  -32768 and bias -2^31, and +32767 with bias 2^31-1); an alternating-extreme
+  weight pattern. Currents span -8,698,462,208 ... 8,698,262,287, all inside
+  signed 35 bits, and the running accumulator also stays inside (asserted in
+  Python).
+
+**Testbench.** `tb_l1_mac` covers: reset; bias initialisation (including
+int32 extremes); one multiplication; multiple accumulations; negative and
+positive weights; zero pixel; largest pixel; extreme int16 weights; `valid=0`
+holding the accumulator; `load_bias` priority over `valid`; a mid-run reset;
+then every primitive vector and every complete neuron. After EVERY clock it
+compares the register with a 64-bit reference accumulator kept in the
+testbench and flags any value outside signed 35 bits (no overflow occurred),
+and after the 784th product it compares with the Python expected current.
+
+**ModelSim results (actually run, ModelSim - Intel FPGA Edition 10.5b).**
+
+```
+cd fpga\tb
+vlog -sv ..\rtl\l1_mac.sv tb_l1_mac.sv
+vsim -c work.tb_l1_mac -do "run -all; quit -f"
+  directed tests    : 15
+  primitive tests   : 20129
+  neuron tests      : 84 (x784 products)
+  MAC (valid) cycles: 85992      (65,856 neuron + 20,129 primitive + 7 directed)
+  total clock cycles: 106213
+  overflow flags    : 0
+  failures          : 0
+  PASS: tb_l1_mac
+```
+
+Compile: 0 errors, 0 warnings.
+
+**Intentional-break checks** (temporary mutants, deleted, not committed; an
+unmutated control compiled from the same mutant file passed with 0 failures):
+
+| Break | Failures detected |
+|---|---|
+| pixel treated as signed 8-bit (200 -> -56) | 73,118 |
+| weight treated as unsigned (-1 -> 65,535) | 71,602 |
+| 23-bit product (too small) | 18,801 |
+| bias forgotten | 66,029 |
+| result checked one clock too early (`-GCHECK_EARLY=1`) | 54,349 |
+
+**Notes.** This is the correctness version: multiply and add share one clock
+stage with no pipeline registers. The pipelined DSP version (product register
+plus accumulator register, 2-cycle drain, see Processing Schedule) will keep
+the same arithmetic. Not yet synthesised, so DSP mapping and timing are
+unverified.
+
 # Open Items (to resolve before RTL)
 
 1. Target FPGA device and BRAM capacity (~100 RAMB36 needed).
