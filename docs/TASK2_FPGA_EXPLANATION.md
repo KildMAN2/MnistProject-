@@ -498,6 +498,169 @@ Levels:
 Planned test benches: `tb_decay`, `tb_lif_core`, `tb_mac`, `tb_l1_current`,
 `tb_snn_top`.
 
+# RTL Milestone 1 — Exact 19/20 Decay
+
+Files: `fpga/rtl/decay_19_20.sv`, `fpga/tb/tb_decay_19_20.sv`,
+`fpga/scripts/generate_decay_vectors.py`,
+`fpga/tb/vectors/decay_19_20_vectors.txt`.
+
+**1. Purpose.** `decay_19_20` computes the leak step of the LIF neuron,
+`decayed = round_ties_to_even(19 * membrane / 20)`, bit-exactly as
+`Int16SNN._lif_step` does. It is the first RTL block; the LIF core, MAC, ROMs,
+controller and top level are not written yet. **This is the correctness /
+reference version: purely combinational, no pipeline registers.** Pipelining
+for timing comes later and must not change the arithmetic.
+
+**2. Equation.** `decayed = RNE(19 m / 20)`, where RNE rounds to the nearest
+integer and resolves exact halves to the even integer.
+
+**3. Why 19/20.** The trained network uses beta = 0.95 = 19/20, and the integer
+reference applies it exactly in integer arithmetic. The hardware must use the
+same rational number, not a nearby cheap constant.
+
+**4. Why truncation is not sufficient.** `m - (m >> 4)` is beta = 0.9375, not
+0.95, and a floor/truncating divide differs from the reference by up to one
+count (and differently for negative numbers). A one-count error in a membrane
+is carried into every later step and can flip a spike. The rule must be exact.
+
+**5. Round-to-nearest, ties-to-even.** The exact value `19m/20` is rounded to
+the nearest integer; if the fractional part is exactly 0.5 the result is the
+neighbouring *even* integer.
+
+**6. Positive example.** m = 11: 19*11/20 = 10.45 -> **10**.
+m = 20: 19 -> **19**.
+
+**7. Negative example.** m = -20: **-19**. m = -11: -10.45 -> **-10**.
+Rounding is applied to the magnitude and the sign is restored afterwards
+(sign-magnitude, matching the reference).
+
+**8. Tie examples.** `19m/20 = N + 0.5` happens exactly when `19|m| mod 20 = 10`,
+which for integers is `|m| = 20t + 10`. The achievable halves are therefore
+9.5, 28.5, 47.5, 66.5, ... (the tie values 2.5 / 3.5 cannot occur as
+`19m/20` for any integer m, because `19m = 50` or `70` has no integer
+solution). Tested: m = 10: 9.5 -> **10**; m = 30: 28.5 -> **28**; m = 50:
+47.5 -> **48**; m = 70: 66.5 -> **66**; and the negatives -10 -> -10,
+-30 -> -28, -50 -> -48, -70 -> -66.
+
+**Block diagram**
+
+```
+ membrane (signed W)
+     |
+     v
+ absolute value (W-bit unsigned magnitude a, sign kept)
+     |
+     v
+ x = 19*a = (a<<4) + (a<<1) + a
+     |
+     v
+ y = x >> 2   (floor(x/20) == floor(y/5))
+     |
+     v
+ q ~ y/5 by shifts/adds:  (y>>1)+(y>>2), then q+=q>>4, >>8, >>16, >>32, then >>2
+     |
+     v
+ exact fix-up: r4 = y - 5q ; q += (r4>=5)+(r4>=10)+(r4>=15)+(r4>=20)
+     |
+     v
+ remainder r = x mod 20 = {y - 5q, x[1:0]}
+     |
+     v
+ ties-to-even: inc = (r > 10) | (r == 10 & q[0]) ; mag = q + inc
+     |
+     v
+ restore sign (two's-complement negate if m < 0)
+     |
+     v
+ decayed membrane (signed W)
+```
+
+**9. Width analysis** (W = MEM_WIDTH = 38; no implicit sizing is relied on,
+every intermediate is declared with an explicit width):
+
+| Signal | Type | Width (W=38) | Bound |
+|---|---|---|---|
+| `membrane_in` | signed | W = 38 | [-2^37, 2^37-1] |
+| `a` (magnitude) | unsigned | W = 38 | <= 2^37 (needs 38 bits as unsigned) |
+| `x = 19a` | unsigned | W+5 = 43 | <= 19*2^37 < 2^42 |
+| `y = x>>2` | unsigned | W+3 = 41 | < 2^40 |
+| `q1..q6` (approx. quotient) | unsigned | W+3 = 41 | <= y/5, never above |
+| `r4 = y - 5q6` | unsigned | W+3 = 41 | observed <= 10 before fix-up |
+| `fix` | unsigned | 3 | 0..4 (observed <= 2) |
+| `q` | unsigned | 41 | = floor(x/20) |
+| `rem_y = y - 5q` | unsigned | 41 (3 used) | 0..4 |
+| `r = x mod 20` | unsigned | 5 | 0..19 |
+| `mag = q + inc` | unsigned | 41 | <= 0.95*2^37 + 1 < 2^37 |
+| `decayed_out` | signed | W = 38 | magnitude < 2^37 |
+
+The shift ladder 4/8/16/32 covers y up to 2^64, so the module is valid for
+MEM_WIDTH 2..60 (checked at elaboration with `$fatal`). The approximation
+error is a small constant (truncation of nine shifts), so four fix-up
+comparators are enough at every width.
+
+**10. Sign handling.** The sign bit is `membrane_in[W-1]`; the magnitude is
+computed as `~m + 1` in W unsigned bits; rounding works on the magnitude; the
+result is negated again (`~mag + 1`) when the input was negative. Rounding on
+the magnitude gives the symmetric result `RNE(-v) = -RNE(v)` that the Python
+reference uses.
+
+**11. Most-negative value.** For `-2^(W-1)` there is no positive W-bit signed
+twos-complement counterpart, so a signed `abs()` would overflow back to
+itself. Here the magnitude is an *unsigned* W-bit value, where `2^(W-1)` is
+representable, and the test file includes `-2^37` (expected -130,567,005,798)
+and `2^37-1`.
+
+**12. Why shift/add.** The constant 19 is `16 + 2 + 1`, divide-by-5 is done
+by a shift ladder plus an exact remainder fix-up, and `5q = 4q + q`. The
+block therefore maps to LUT adders/comparators with **no DSP slices and no
+`*` or `/` operators** (the 6-DSP reciprocal multiplier option is not used).
+
+**13. Vector generation.** `py -m fpga.scripts.generate_decay_vectors` uses the
+*real* reference `_round_ratio_ties_to_even(m*19, 20)` (not the RTL algorithm)
+as the oracle and writes 49,104 lines of `input expected` (38-bit
+two's-complement hex) to `fpga/tb/vectors/decay_19_20_vectors.txt`. It
+covers 0, +-1, +-20, threshold-related values (both layers, +-1,2,3 x thr
++-2), measured and full-range extremes (-2^37, 2^37-1), powers of two and +-1
+for every bit, every integer in -2000..2000, 6,915 tie cases
+(`19|m| mod 20 = 10`, including large ones), 20,000 uniform random values and
+20,000 log-uniform random magnitudes.
+
+**14. Testbench.** `tb_decay_19_20` instantiates the DUT with MEM_WIDTH=38,
+runs 19 directed cases (including the ties and the most-negative value) and
+then every file vector, comparing with `!==` on signed vectors. On a mismatch
+it prints the index, input and expected/actual in decimal and hex; it
+counts tests and failures and ends in `PASS` or `$fatal`.
+
+**15. Simulation result (actually run).** Simulator: ModelSim - Intel FPGA
+Edition 10.5b (`C:\intelFPGA_lite\17.0\modelsim_ase`). Compile 0 errors,
+0 warnings.
+
+```
+cd fpga\tb
+vlib work
+vlog -sv ..\rtl\decay_19_20.sv tb_decay_19_20.sv
+vsim -c work.tb_decay_19_20 -do "run -all; quit -f"
+  directed tests : 19
+  file vectors   : 49104
+  total tests    : 49123
+  failures       : 0
+  PASS: tb_decay_19_20
+```
+
+The testbench was also shown to be able to fail: a mutant using round-half-up
+instead of ties-to-even produced many mismatches (e.g. m = 30 gave 29 instead
+of 28) and `FAIL`; the mutant was then deleted.
+For other simulators: Verilator `verilator --binary -sv ../rtl/decay_19_20.sv
+tb_decay_19_20.sv --top-module tb_decay_19_20`; Vivado
+`xvlog -sv ...; xelab tb_decay_19_20; xsim tb_decay_19_20 -runall` (run from
+`fpga/tb`; these two were not run).
+
+**Synthesis / timing note (not yet measured).** No synthesis has been run. The
+combinational path is an adder chain (x, six shift-adds, 5q, subtract, 4
+compares, 5q, subtract, increment, negate) of up to ~43 bits, so it will not
+meet a high clock rate unpipelined; pipelining at the x, q6, fix-up and
+rounding boundaries is planned.
+
 # Open Items (to resolve before RTL)
 
 1. Target FPGA device and BRAM capacity (~100 RAMB36 needed).
@@ -512,3 +675,4 @@ Planned test benches: `tb_decay`, `tb_lif_core`, `tb_mac`, `tb_l1_current`,
 8. Beta is hard-coded as 19/20.
 9. Add an argmax tie test vector.
 10. (Resolved) The repository reorganization and the LIF correction are on `origin/main`.
+

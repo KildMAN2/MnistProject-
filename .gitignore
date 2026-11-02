@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 data/
 *.tmp
+fpga/tb/work/
+fpga/tb/transcript
+fpga/tb/vsim.wlf
