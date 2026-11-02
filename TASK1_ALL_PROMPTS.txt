@@ -1,0 +1,829 @@
+TASK 1 PROMPTS
+==============
+
+This file collects the substantive Task 1 project prompts from our
+conversation, in chronological order. The first request specified an int16
+hardware target; a later request restarted Task 1 with a focus on the Python
+architecture and explicitly deferred quantization. Later requests add the
+LIF explanation, model implementation, and MNIST input pipeline.
+
+
+PROMPT 1 — INITIAL NEUROMORPHIC HARDWARE TASK
+--------------------------------------------
+
+We are starting Task 1 of my real neuromorphic hardware project.
+
+Task 1 is to implement and train a Spiking Neural Network in Python that
+classifies MNIST.
+
+This Python implementation will later become the reference model for a
+SystemVerilog hardware implementation.
+
+IMPORTANT NUMERIC REQUIREMENT:
+
+The final inference network must use signed 16-bit INTEGER weights.
+
+Weight format:
+
+signed int16
+
+Range:
+
+-32768 to +32767
+
+Do NOT design this project around 8-bit weights.
+
+During training, PyTorch may maintain floating-point shadow weights because
+gradient-based training requires floating-point parameters.
+
+However, the project must include a clear path:
+
+floating-point training weights
+-> scaling
+-> rounding
+-> clipping
+-> signed int16 weights
+-> integer inference/reference model
+
+The final exported weights used for hardware must be signed 16-bit integers.
+
+Use:
+- Python
+- PyTorch
+- snnTorch
+- MNIST
+- Leaky Integrate-and-Fire neurons
+- surrogate-gradient training
+
+Start with a hardware-friendly fully-connected SNN architecture:
+
+28x28 MNIST image
+-> flatten to 784 inputs
+-> Linear(784, hidden_size)
+-> LIF neurons
+-> Linear(hidden_size, 10)
+-> output LIF neurons
+-> spike counting
+-> argmax
+-> predicted digit 0-9
+
+Do NOT write SystemVerilog yet.
+
+First design the complete Python reference architecture and explain how the
+16-bit integer weight requirement affects the design.
+
+IMPORTANT DOCUMENTATION REQUIREMENT:
+
+Create and continuously update:
+
+TASK1_EXPLANATION.md
+
+In TASK1_EXPLANATION.md explain:
+
+1. What MNIST is.
+2. What an SNN is.
+3. The selected network architecture.
+4. What neurons, weights, and biases are.
+5. What Linear layers calculate.
+6. What LIF neurons calculate.
+7. Why time steps are required.
+8. Why normal training uses floating-point shadow weights.
+9. Why the final project requires signed int16 weights.
+10. The signed int16 range.
+11. How floating-point weights will later be converted to int16.
+12. Why clipping, rounding, and scaling are required.
+13. How the int16 model will later correspond to SystemVerilog.
+
+Do not only explain it in the chat.
+Write the detailed explanation into TASK1_EXPLANATION.md.
+
+
+PROMPT 2 — RESTART TASK 1 WITH PYTHON ARCHITECTURE
+--------------------------------------------------
+
+We are starting Task 1 of my real project.
+
+Task 1:
+Implement a Python Spiking Neural Network that classifies the MNIST
+handwritten-digit dataset.
+
+This Python model will later be used as the reference model for a SystemVerilog
+hardware implementation.
+
+Use:
+- Python
+- PyTorch
+- snnTorch
+- MNIST
+- fully-connected layers
+- Leaky Integrate-and-Fire (LIF) neurons
+- surrogate-gradient training
+
+For now:
+- DO NOT write SystemVerilog.
+- DO NOT quantize to 8-bit yet.
+- DO NOT use convolutional layers unless we decide later that they are
+  necessary.
+- Keep the architecture hardware-friendly.
+
+First create the project structure and propose the SNN architecture.
+
+Suggested starting architecture:
+
+28x28 MNIST image
+-> flatten to 784 inputs
+-> Linear(784, hidden_size)
+-> LIF neurons
+-> Linear(hidden_size, 10)
+-> output LIF neurons
+-> count output spikes across time
+-> argmax
+-> predicted digit 0-9
+
+Create the necessary project files.
+
+IMPORTANT:
+Also create a Markdown file named:
+
+TASK1_EXPLANATION.md
+
+This Markdown file is part of the project documentation.
+
+In TASK1_EXPLANATION.md explain in detail:
+
+1. What MNIST is.
+2. What the input image contains.
+3. Why 28x28 becomes 784.
+4. What a Spiking Neural Network is.
+5. Difference between a normal ANN and an SNN.
+6. The complete architecture we chose.
+7. What every layer does.
+8. Why this architecture is suitable for later SystemVerilog
+   implementation.
+9. A text block diagram of the network.
+10. The purpose of every Python file in the project.
+
+Do not only explain these things in the chat.
+Write the explanation into TASK1_EXPLANATION.md.
+
+
+PROMPT 3 — EXPLAIN AND IMPLEMENT THE LIF NEURON
+----------------------------------------------
+
+Continue Task 1.
+
+Before training the complete network, explain and implement the Leaky
+Integrate-and-Fire neuron behavior used by our SNN.
+
+Use the same LIF model that will be used in the real network.
+
+Explain:
+
+- input current
+- membrane potential
+- beta / decay
+- threshold
+- spike
+- reset
+- time steps
+- why membrane potential must be stored between time steps
+
+Show the mathematical equations.
+
+Also show one numerical example of a neuron over at least 5 time steps.
+
+For example:
+
+time t
+input current
+previous membrane potential
+decayed membrane potential
+new membrane potential
+whether a spike occurs
+membrane after reset
+
+IMPORTANT:
+
+Update TASK1_EXPLANATION.md.
+
+Add a section:
+
+# Leaky Integrate-and-Fire Neuron
+
+The Markdown explanation must contain:
+
+1. Mathematical equation.
+2. Meaning of every variable.
+3. Numerical example.
+4. Explanation of beta.
+5. Explanation of threshold.
+6. Explanation of spike generation.
+7. Explanation of reset.
+8. Why time is important in an SNN.
+9. How this may later map to hardware registers, adders, comparators, and
+   state.
+
+Do not only explain it in the response.
+Save the complete explanation in TASK1_EXPLANATION.md.
+
+
+PROMPT 4 — IMPLEMENT THE REAL MODEL
+-----------------------------------
+
+Now implement the real SNN model for Task 1 in model.py.
+
+Use PyTorch and snnTorch.
+
+Architecture:
+
+Input:
+[batch, 1, 28, 28]
+
+Flatten:
+[batch, 784]
+
+First Linear layer:
+784 -> hidden_size
+
+First LIF layer
+
+Second Linear layer:
+hidden_size -> 10
+
+Output LIF layer:
+10 spiking neurons
+
+Requirements:
+
+- hidden_size must be configurable
+- beta must be configurable
+- threshold must be configurable
+- num_steps must be configurable
+- use surrogate gradients
+- correctly initialize/reset membrane potentials
+- simulate the network over multiple time steps
+- record output spikes for every time step
+- optionally record membrane potentials for debugging
+
+Keep the implementation clean because later we will reproduce this inference
+behavior in SystemVerilog.
+
+After implementing model.py:
+
+Update TASK1_EXPLANATION.md.
+
+Add a section:
+
+# SNN Model Architecture
+
+Explain:
+
+1. Input tensor dimensions.
+2. Flatten operation.
+3. What Linear(784, hidden_size) means.
+4. What one neuron computes mathematically.
+5. Weights.
+6. Bias.
+7. Why every hidden neuron has different weights.
+8. What happens after the Linear layer.
+9. What the first LIF layer does.
+10. What Linear(hidden_size,10) does.
+11. What the 10 output neurons represent.
+12. Tensor dimensions after every stage.
+13. Complete forward data flow.
+
+Include formulas such as:
+
+y_j = sum(x_i * w_j_i) + b_j
+
+Do not leave the explanation only in comments.
+Put the detailed explanation into TASK1_EXPLANATION.md.
+
+
+PROMPT 5 — IMPLEMENT MNIST DATA PIPELINE AND CHOOSE TIME ENCODING
+-----------------------------------------------------------------
+
+Now implement the MNIST dataset pipeline for Task 1.
+
+Use torchvision.datasets.MNIST.
+
+Create dataset.py if it does not already exist.
+
+Requirements:
+
+- training dataset
+- test dataset
+- DataLoader
+- configurable batch size
+- appropriate normalization
+- clear separation between train and test data
+
+Then decide how the static MNIST image is presented to the SNN over time.
+
+Compare:
+
+1. Direct/static current injection:
+   use the same pixel values at each time step.
+
+2. Rate coding:
+   convert pixel intensities into spike probabilities.
+
+For the first version of this project, choose the method that is simpler and
+more deterministic for later SystemVerilog implementation.
+
+Implement the selected approach.
+
+IMPORTANT:
+
+Update TASK1_EXPLANATION.md.
+
+Add a section:
+
+# MNIST Input and Time Encoding
+
+Explain:
+
+- what one MNIST sample looks like
+- pixel values
+- normalization
+- batch dimensions
+- why an SNN requires time steps
+- direct current encoding
+- rate coding
+- advantages and disadvantages of each
+- which method we selected
+- why it is more suitable for the hardware project
+
+Include a diagram such as:
+
+MNIST image
+-> 784 values
+-> time step 0
+-> time step 1
+-> ...
+-> time step T-1
+
+Write all of this into TASK1_EXPLANATION.md.
+
+
+PROMPT 6 — IMPLEMENT THE TRAINING FLOW
+--------------------------------------
+
+Now implement the real training flow for Task 1 in train.py.
+
+Requirements:
+
+- load the MNIST training data
+- instantiate our SNN model
+- support CUDA if available
+- configurable epochs
+- configurable learning rate
+- configurable batch size
+- configurable num_steps
+- Adam optimizer
+- appropriate classification loss for the SNN
+- surrogate-gradient backpropagation
+- reset neuron states correctly
+- calculate training accuracy
+- print useful training information
+- save the best model checkpoint
+
+The training must use the architecture already defined in model.py.
+
+Do not replace the architecture with a different model.
+
+IMPORTANT:
+
+Update TASK1_EXPLANATION.md.
+
+Add a section:
+
+# SNN Training
+
+Explain step by step:
+
+1. What training means.
+2. Initial random weights.
+3. Forward pass.
+4. Simulation over time.
+5. Output spikes.
+6. Correct label.
+7. Loss.
+8. Why normal spike derivatives are problematic.
+9. Surrogate gradients.
+10. Backpropagation Through Time.
+11. Optimizer.
+12. Weight update.
+13. Epoch.
+14. Batch.
+15. Learning rate.
+16. Why training happens in Python rather than later in SystemVerilog.
+
+Include a flow diagram:
+
+image + label
+-> forward SNN
+-> spike outputs
+-> loss
+-> backward
+-> gradients
+-> update weights
+-> repeat
+
+Write the full explanation into TASK1_EXPLANATION.md.
+
+
+PROMPT 7 — IMPLEMENT OUTPUT SPIKE COUNTING AND CLASSIFICATION
+-------------------------------------------------------------
+
+Now implement the final classification logic for our SNN.
+
+The output layer contains 10 spiking neurons.
+
+Each neuron corresponds to one digit:
+
+neuron 0 -> digit 0
+neuron 1 -> digit 1
+...
+neuron 9 -> digit 9
+
+For every sample, count the number of spikes produced by each output neuron
+over all time steps.
+
+Compute:
+
+spike_count[j] = sum_t spike[t][j]
+
+Then:
+
+prediction = argmax(spike_count)
+
+Implement this cleanly in the project.
+
+Also make it possible to print the 10 spike counts for debugging.
+
+IMPORTANT:
+
+Update TASK1_EXPLANATION.md.
+
+Add:
+
+# Output Spike Counting and Classification
+
+Explain:
+
+- why there are 10 output neurons
+- what one output spike means
+- why we accumulate spikes over time
+- spike count
+- argmax
+- example with 10 spike counts
+- how the predicted digit is selected
+- how spike counters and argmax could later be implemented in hardware
+
+Use a detailed numerical example.
+
+Write the explanation into TASK1_EXPLANATION.md.
+
+
+
+
+PROMPT 8 — REPEATED OUTPUT CLASSIFICATION REQUEST
+-------------------------------------------------
+
+Now implement the final classification logic for our SNN.
+
+The output layer contains 10 spiking neurons.
+
+Each neuron corresponds to one digit:
+
+neuron 0 -> digit 0
+neuron 1 -> digit 1
+...
+neuron 9 -> digit 9
+
+For every sample, count the number of spikes produced by each output neuron
+over all time steps.
+
+Compute:
+
+spike_count[j] = sum_t spike[t][j]
+
+Then:
+
+prediction = argmax(spike_count)
+
+Implement this cleanly in the project.
+
+Also make it possible to print the 10 spike counts for debugging.
+
+IMPORTANT:
+
+Update TASK1_EXPLANATION.md.
+
+Add:
+
+# Output Spike Counting and Classification
+
+Explain:
+
+- why there are 10 output neurons
+- what one output spike means
+- why we accumulate spikes over time
+- spike count
+- argmax
+- example with 10 spike counts
+- how the predicted digit is selected
+- how spike counters and argmax could later be implemented in hardware
+
+Use a detailed numerical example.
+
+Write the explanation into TASK1_EXPLANATION.md.
+
+
+PROMPT 9 — IMPLEMENT TEST-SET EVALUATION
+----------------------------------------
+
+Now implement evaluate.py for Task 1.
+
+Requirements:
+
+- load the best trained checkpoint
+- run the complete MNIST test dataset
+- use torch.no_grad()
+- correctly initialize/reset SNN states
+- perform inference for num_steps
+- count output spikes
+- calculate argmax prediction
+- calculate total test accuracy
+- show several example predictions
+
+For each displayed example show:
+
+- true digit
+- predicted digit
+- spike count for all 10 output neurons
+
+At the end print:
+
+- number of correct predictions
+- number of test samples
+- final accuracy percentage
+
+IMPORTANT:
+
+Update TASK1_EXPLANATION.md.
+
+Add:
+
+# Evaluation
+
+Explain:
+
+1. Difference between training and inference.
+2. Difference between training set and test set.
+3. Why the network must be tested on unseen samples.
+4. How accuracy is calculated.
+5. What overfitting means.
+6. What inference will mean later in the SystemVerilog version.
+
+Write the explanation into TASK1_EXPLANATION.md.
+
+
+PROMPT 10 — REVIEW AND COMPLETE TASK 1
+--------------------------------------
+
+Task 1 should now be complete.
+
+Review the complete Python SNN MNIST project.
+
+Do not redesign the network unless there is a real bug.
+
+Verify:
+
+- dataset loading
+- model architecture
+- tensor dimensions
+- LIF state handling
+- time-step simulation
+- spike recording
+- loss calculation
+- surrogate-gradient training
+- checkpoint saving
+- evaluation
+- spike counting
+- argmax
+- test accuracy
+
+Then update TASK1_EXPLANATION.md so that it becomes a complete technical
+explanation of Task 1.
+
+The Markdown document should contain these sections in this order:
+
+# Task 1 — Spiking Neural Network for MNIST
+
+## 1. Goal of Task 1
+## 2. What MNIST Is
+## 3. Input Representation
+## 4. Neural Networks: Neurons, Weights and Biases
+## 5. Linear Layers
+## 6. What a Spiking Neural Network Is
+## 7. LIF Neuron
+## 8. Membrane Potential
+## 9. Threshold and Spike Generation
+## 10. Time Steps
+## 11. Complete Network Architecture
+## 12. Forward Pass
+## 13. Training
+## 14. Surrogate Gradients
+## 15. Spike Counting
+## 16. Classification
+## 17. Evaluation and Accuracy
+## 18. Final Trained Parameters
+## 19. What Will Be Needed for the Future SystemVerilog Implementation
+
+Include:
+
+- equations
+- tensor dimensions
+- numerical examples
+- ASCII/block diagrams
+- architecture parameters
+- final test accuracy
+- hidden size
+- beta
+- threshold
+- num_steps
+- total number of weights
+- total number of biases
+
+The Markdown file should be understandable to a student who has never studied
+SNNs before.
+
+Do not only summarize it in the chat.
+
+Actually create/update TASK1_EXPLANATION.md in the repository.
+
+
+PROMPT 11 — REQUIRE SIGNED-INT16 INFERENCE WEIGHTS
+-------------------------------------------------
+
+Important correction to the existing Task 1 project.
+
+I forgot to specify a required numeric constraint earlier:
+
+THE FINAL INFERENCE WEIGHTS MUST BE SIGNED 16-BIT INTEGERS.
+
+Please update the existing Python SNN MNIST project accordingly.
+
+Do NOT rebuild the project from scratch unless necessary.
+Keep the current architecture and training flow if they are already working.
+
+Requirements:
+
+1. Training may still use floating-point shadow weights because PyTorch
+   backpropagation requires differentiable floating-point parameters.
+
+2. After training, every Linear-layer weight must be converted to signed
+   int16.
+
+Required range:
+
+-32768 to +32767
+
+3. Do NOT simply cast float weights directly to int16.
+
+Implement proper quantization using a scale factor.
+
+For each layer, use a procedure conceptually like:
+
+scale = max(abs(weight_float)) / 32767
+
+weight_int16 = round(weight_float / scale)
+
+weight_int16 = clip(weight_int16, -32768, 32767)
+
+Store the result as:
+
+torch.int16 or numpy.int16
+
+4. Save the scale factor for every quantized layer.
+
+The approximate floating-point interpretation must be recoverable as:
+
+weight_approx = weight_int16 * scale
+
+5. Create a separate integer/quantized inference path.
+
+I want to be able to compare:
+
+A. Original floating-point SNN inference
+
+and
+
+B. Quantized SNN inference using the signed int16 weights
+
+6. Evaluate the MNIST test accuracy of both models.
+
+Print something like:
+
+Floating-point accuracy: XX.XX%
+Int16-weight accuracy:   XX.XX%
+Accuracy loss:           XX.XX%
+
+7. For the int16 inference model, do not silently convert the stored weights
+back into the original floating-point PyTorch Linear layer and pretend it is
+integer inference.
+
+Make the quantized arithmetic explicit enough that it can later serve as the
+reference for SystemVerilog.
+
+8. Inspect biases separately.
+
+Explain whether biases should:
+- remain floating-point for Task 1,
+- be quantized to a wider integer format,
+- or be converted using the input-scale × weight-scale relationship.
+
+Do not make an arbitrary choice.
+Recommend the hardware-friendly option and document it.
+
+9. Add export files for later hardware use.
+
+For every layer export:
+- int16 weights
+- scale factor
+- biases in the selected representation
+- tensor/matrix dimensions
+
+Use clear filenames.
+
+Example:
+
+layer1_weights_int16.npy
+layer1_scale.npy
+layer1_bias.npy
+
+layer2_weights_int16.npy
+layer2_scale.npy
+layer2_bias.npy
+
+10. Add verification checks:
+
+- confirm every exported weight is int16
+- confirm no weight is outside [-32768, 32767]
+- report min/max integer weight for each layer
+- report scale for each layer
+- compare several float weights against their quantized and reconstructed
+  values
+
+11. Update TASK1_EXPLANATION.md.
+
+Add a detailed section:
+
+# 16-Bit Integer Weight Quantization
+
+Explain:
+
+- why PyTorch training still uses floating-point weights
+- why final hardware weights must be int16
+- int16 range
+- scale factor
+- rounding
+- clipping
+- quantization equation
+- dequantization equation
+- one complete numerical example
+- per-layer scaling
+- quantization error
+- effect on accuracy
+- how int16 weights will later be stored in SystemVerilog
+- why a 16-bit × 16-bit multiplication produces a wider product
+- why the accumulator will need more than 16 bits
+
+Do not only explain the changes in the chat.
+Actually modify the project and update TASK1_EXPLANATION.md.
+
+
+PROMPT 12 — AUDIT SIGNED-INT16 WEIGHT REQUIREMENT
+-------------------------------------------------
+
+Now audit the project specifically for the new signed int16 weight
+requirement.
+
+Check every file and find any place that still assumes:
+
+- 8-bit weights
+- uint weights
+- float-only inference weights
+- incorrect scale usage
+- direct float-to-int16 casting
+- missing clipping
+- missing saved scale factors
+
+Also verify that the int16 inference result is mathematically consistent with
+the exported weight files.
+
+Fix only the issues related to this requirement.
+
+Then update TASK1_EXPLANATION.md with the final verified numeric format.

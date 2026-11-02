@@ -1,0 +1,119 @@
+{
+  "format": "signed int16 weights; int32 accumulator-unit biases",
+  "weight_dtype": "int16",
+  "weight_signed_range": [
+    -32768,
+    32767
+  ],
+  "weight_quantization": "q = clip(round_ties_to_even(w / (max_abs(w) / 32767)), -32768, 32767)",
+  "input_representation": {
+    "pixels": "uint8-range codes in [0, 255], widened to int64 for arithmetic",
+    "pixel_scale": 0.00392156862745098,
+    "hidden_spikes": "binary codes in [0, 1], widened to int64 for arithmetic",
+    "hidden_spike_scale": 1.0
+  },
+  "bias_representation": "int32 bias codes in the corresponding layer accumulator units; bias_scale = input_scale * weight_scale",
+  "network": {
+    "input_features": 784,
+    "hidden_size": 256,
+    "output_classes": 10,
+    "num_steps": 25,
+    "beta": 0.95,
+    "threshold": 1.0,
+    "weight_layout": "PyTorch Linear [output, input], row-major"
+  },
+  "layers": {
+    "layer1": {
+      "weight_shape": [
+        256,
+        784
+      ],
+      "weight_dtype": "int16",
+      "weight_file": "layer1_weights_int16.npy",
+      "weight_scale_file": "layer1_scale.npy",
+      "weight_scale": 6.760662336259554e-06,
+      "bias_shape": [
+        256
+      ],
+      "bias_dtype": "int32",
+      "bias_file": "layer1_bias_int32.npy",
+      "bias_scale_file": "layer1_bias_scale.npy",
+      "bias_scale": 2.6512401318664917e-08,
+      "integer_weight_min": -32767,
+      "integer_weight_max": 30834,
+      "weight_sample_comparison": [
+        {
+          "float": -0.00026738643646240234,
+          "int16": -40,
+          "reconstructed": -0.00027042649345038216
+        },
+        {
+          "float": 0.019158702343702316,
+          "int16": 2834,
+          "reconstructed": 0.019159717060959574
+        },
+        {
+          "float": -0.029394470155239105,
+          "int16": -4348,
+          "reconstructed": -0.02939535983805654
+        },
+        {
+          "float": -0.026283537968993187,
+          "int16": -3888,
+          "reconstructed": -0.026285455163377144
+        },
+        {
+          "float": -0.013755513355135918,
+          "int16": -2035,
+          "reconstructed": -0.013757947854288192
+        }
+      ]
+    },
+    "layer2": {
+      "weight_shape": [
+        10,
+        256
+      ],
+      "weight_dtype": "int16",
+      "weight_file": "layer2_weights_int16.npy",
+      "weight_scale_file": "layer2_scale.npy",
+      "weight_scale": 6.071987847556862e-06,
+      "bias_shape": [
+        10
+      ],
+      "bias_dtype": "int32",
+      "bias_file": "layer2_bias_int32.npy",
+      "bias_scale_file": "layer2_bias_scale.npy",
+      "bias_scale": 6.071987847556862e-06,
+      "integer_weight_min": -32767,
+      "integer_weight_max": 26127,
+      "weight_sample_comparison": [
+        {
+          "float": -0.006736084818840027,
+          "int16": -1109,
+          "reconstructed": -0.00673383452294056
+        },
+        {
+          "float": -0.0386095829308033,
+          "int16": -6359,
+          "reconstructed": -0.03861177072261408
+        },
+        {
+          "float": 0.03843884542584419,
+          "int16": 6331,
+          "reconstructed": 0.03844175506288249
+        },
+        {
+          "float": -0.01069554127752781,
+          "int16": -1761,
+          "reconstructed": -0.010692770599547633
+        },
+        {
+          "float": 0.010100153274834156,
+          "int16": 1663,
+          "reconstructed": 0.010097715790487061
+        }
+      ]
+    }
+  }
+}
