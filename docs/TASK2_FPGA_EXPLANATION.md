@@ -135,7 +135,7 @@ Key observations from the Python reference (`Int16SNN`):
 
 | | A: 1 MAC serial | B: P lanes along inputs (P=16) | C: A + cached cur1 (selected) | D: P_N neurons in parallel |
 |---|---|---|---|---|
-| DSP | 1 | 16 | 1 | P_N |
+| DSP (L1 MAC only; decay adds 0 with the shift/add unit, 6 with the reciprocal multiplier) | 1 | 16 | 1 | P_N |
 | Weight BRAM | 98 RAMB36 | 98 (wide 256-bit words) | 98 | 98, banked by neuron |
 | L1 cycles/image | ~5.1 M (recompute each step) | ~320 k | ~201 k once | ~201 k / P_N |
 | Weight bandwidth | 16 b/clk | 256 b/clk | 16 b/clk | 16·P_N b/clk |
@@ -157,7 +157,7 @@ snn_top
 ├── l1_mac                9b signed x int16 -> 24b, accumulate to ACC1 (35b)
 ├── simple_dp_ram (cur1)  256 x 35
 ├── simple_dp_ram (mem1)  256 x 38
-├── lif_core (L1)         decay19_20 + add + threshold + subtract reset
+├── lif_core (L1)         prev_reset cmp, decay19_20, base add, 2 cond. thr subtracts, strict spike cmp
 ├── hidden_spike_reg      256 FFs, 8->256 write decode, 256:1 read mux
 ├── rom_sync (w2)         2,560 x 16
 ├── rom_sync (b2)         10 x 32
@@ -227,9 +227,28 @@ in this format; "proven" uses the actual exported weights.
 | ACC2 | 33 | 21 | 19 |
 | MEM2 | 36 | 26 | 23 |
 
-Membrane bound: `M_{t+1} <= 0.95*M_t + 0.5 + C + thr`, iterated over 25
-steps (conservative). Partial sums never exceed the final bound, so the bias
-may be added at any point without intermediate overflow.
+Re-checked with the `pre_spike` path restored (`fpga/scripts/lif_width_check.py`,
+interval propagation over 25 steps; `decayed` is within +-(0.95|M|+0.5),
+`base = decayed + cur`, `pre_spike` and `mem_new` both lie in
+`[base_min - thr, base_max]`):
+
+| Signal | L1 generic | L1 proven | L2 generic | L2 proven |
+|---|---|---|---|---|
+| `cur` | 35 | 31 | 33 | 21 |
+| `decayed` | 38 | 35 | 36 | 25 |
+| `base` | 38 | 35 | 36 | 26 |
+| `pre_spike` | 38 | 35 | 36 | 26 |
+| `mem_new` | 38 | 35 | 36 | 26 |
+| threshold (positive) | 27 | 27 | 19 | 19 |
+
+Membrane interval bound (generic L1): [-1.26e11, 1.26e11] (< 2^37). The
+threshold is far smaller than the membrane range, and the subtraction
+`base - thr` is already included in the `pre_spike`/`mem_new` bounds, so it
+cannot overflow when those signals use the widths above. The input to the
+decay block, `x = 19|m|`, stays below 2^42 (needs < 2^46 for the exact
+reciprocal variant). Widths are unchanged from the earlier table; restoring
+`previous_reset` does not widen anything. Partial sums never exceed the final
+bound, so the bias may be added at any point without intermediate overflow.
 
 Recommendation: use the generic-safe widths as parameters, plus a generator
 assertion that the proven bounds hold for the exported files. Tight widths are
@@ -251,10 +270,42 @@ spike   = pre > thr                 (strict)
 mem_new = pre - (spike - pr)*thr
 ```
 
-**Identity.** `mem_new = decayed + cur - spike*thr`, because the `pr*thr`
-terms cancel; `pr` never affects the spike decision beyond the algebra above.
-Hardware therefore uses the simplified form: one add, one compare, one
-conditional subtract.
+**Correction (supersedes the earlier draft).** Only the *final membrane*
+simplifies: `mem_new = (decayed + cur) - spike*thr`, because the `pr*thr`
+terms cancel. **`previous_reset` is NOT removable from the spike decision.**
+`spike = (decayed + cur - pr*thr) > thr` differs from
+`spike = (decayed + cur) > thr` whenever `pr = 1`.
+Example: thr=100, mem=120, decayed=114, cur=50, pr=1: base=164,
+pre_spike=64, spike=0; the rejected form would give spike=1. Measured with
+the real thresholds, the rejected form picks the wrong spike in about 4 % of
+random vectors (16,742 of 400,282 for layer 1), so it is invalid.
+
+**Hardware equations (all comparisons strict `>`, exactly as Python):**
+
+```
+prev_reset = mem > thr                    # comparator on the stored membrane
+decayed    = exact round_ties_to_even(19*mem/20)       # decay block
+base       = decayed + cur
+pre_spike  = base - (prev_reset ? thr : 0)  # conditional subtract #1
+spike      = pre_spike > thr                # strict comparator
+mem_new    = base - (spike ? thr : 0)       # conditional subtract #2
+```
+
+Datapath of one `lif_core` (comparator 1 and the decay block run in parallel):
+
+```
+mem --+--> [ > thr ] ------------------------> prev_reset
+      |                                            |
+      +--> [ decay 19/20, ties-even ] --> decayed  |
+cur ---------------------------------> [ + ] --> base
+                       base --> [ - (prev_reset?thr:0) ] --> pre_spike
+                       pre_spike --> [ > thr ] --> spike  (-> counter / s1[j])
+                       base --> [ - (spike?thr:0) ] --> mem_new --> mem RAM
+```
+
+Verified by `fpga/scripts/lif_equiv_check.py` (see Verification Results
+below). Note that `pre_spike` is used only for the comparison; it is not
+stored (the stored value is `mem_new`).
 
 **Decay by 19/20 with ties-to-even** (sign-magnitude, no divider):
 
@@ -271,11 +322,59 @@ Exactness: `M*20 - 2^48 = 4`, and the reciprocal error stays below the
 algorithm was checked bit-exact against `Int16SNN`: 0 mismatches in 600,011
 decay cases (random to +-2^37, all ties `20k+10`, edges) and 0 mismatches in
 300,000 full LIF steps for each of thr = 37,718,198 / 164,691 / 12,345 / 1.
-Fallback if the 42x44 multiplier misses timing: serial restoring divider
-(~42 cycles, about +300 k cycles/image).
+### Decay implementation options and realistic DSP cost
+
+The reciprocal multiply above is **not** a one-DSP operation. A 42-bit by
+44-bit unsigned product on a DSP48E1 (25x18 signed = 24x17 unsigned) needs
+ceil(42/24) x ceil(44/17) = 2 x 3 = **6 DSP slices** (DSP48E2 27x18: also 6),
+plus an adder tree and a pipeline of ~4-5 stages. The earlier "about 1 DSP"
+figure counted only the layer-1 MAC and was incomplete.
+
+| Option | DSP | LUT / logic | Latency | Notes |
+|---|---|---|---|---|
+| A. Reciprocal constant multiplier (42x44) | 6 per instance (6 total if one decay unit is shared by both layers) | adder tree | 4-5 stages | Exact for x < 2^46. M has 23 set bits, so a LUT-only constant multiplier is possible but large |
+| B. Shift/add + exact divide-by-5 (x=19a, y=x>>2, q~y/5 by shifts, fix-up) | **0** | ~12 wide adders + 4 comparators | 3-4 pipeline stages | Bit-exact, verified |
+| C. Sequential restoring divider | 0 | small | ~42 cycles/neuron update (about +300 k cycles/image, roughly 2x slower) | Smallest, slowest |
+| D. **Recommended:** option B | 0 | see B | 3-4 stages, 1 result/clock | No DSP competition with the L1 MAC |
+
+Option B/D in detail (all integer, no multiplier):
+
+```
+a = |m|;  x = 19a = (a<<4)+(a<<1)+a;  y = x >> 2        # floor(x/20) = floor(y/5)
+q = (y>>1)+(y>>2); q += q>>4; q += q>>8; q += q>>16; q += q>>32; q >>= 2
+q += (y-5q >= 5) + (y-5q >= 10) + (y-5q >= 15) + (y-5q >= 20)  # fix-up
+r = ((y - 5q) << 2) | x[1:0]                           # = x mod 20, 0..19
+inc = (r > 10) | (r == 10 & q[0]);  mag = q + inc;  decayed = m<0 ? -mag : mag
+```
+
+The approximation never exceeds the true quotient; the largest fix-up
+observed was 10 (< 15), so the comparators cover the range. Correctness is
+not traded for DSPs: the tie rule is applied on the exact remainder.
+Overall DSP budget: **1 (L1 MAC) with option D**, or 7 (1 + 6) with option A
+(if a shared reciprocal unit is used; 13 if each `lif_core` has its own).
+
+## Verification Results (Python equivalence of the hardware equations)
+
+`py -m fpga.scripts.lif_equiv_check` compares `hw_lif` against
+`Int16SNN._lif_step` bit-for-bit (membrane and spike):
+
+| Test set | Vectors | Mismatches |
+|---|---|---|
+| Layer-1 threshold 37,718,198 | 400,282 | **0** |
+| Layer-2 threshold 164,691 | 400,282 | **0** |
+| thr = 12,345 | 400,282 | **0** |
+| thr = 1 | 400,282 | **0** |
+| Shift/add decay vs reference rounding (ties, +-2^k edges, random to 2^38) | 410,222 | **0** |
+| Full LIF with shift/add decay, L1 / L2 / thr=1 | 3 x 150,000 | **0** |
+
+Vectors cover positive and negative membranes, mem == thr, thr-1, thr+1, 2thr,
+`pre_spike` exactly at thr-1 / thr / thr+1 with `pr = 1`, positive and negative
+currents, spike and no-spike (about 148 k spikes, 252 k non-spikes per set),
+all `20k+10` ties, and random values. The same run shows the rejected
+simplification mispredicting spikes (16,742 / 16,764 / 16,659 / 8,407 cases).
 
 Hidden spikes are produced and consumed within the same time step; the
-`previous_reset` term is derived from the stored membrane. Output LIF uses
+`previous_reset` term is derived from the stored membrane (`mem > thr`). Output LIF uses
 the same `lif_core` with the layer-2 threshold. Argmax ties resolve to the
 lowest index, matching `torch.argmax` (tested).
 
@@ -354,8 +453,9 @@ Planned test benches: `tb_decay`, `tb_lif_core`, `tb_mac`, `tb_l1_current`,
 4. Thresholds must be exported from `Int16SNN`, not recomputed.
 5. **Confirm the cached-L1-current schedule** (deviates from the literal
    "recompute every step"; numerically identical).
-6. Pipeline depth of the 42x44 reciprocal multiplier vs the clock target.
+6. Timing of the shift/add decay pipeline (3-4 stages, 42-bit adders) vs the
+   clock target; the 6-DSP reciprocal multiplier remains an alternative.
 7. Simulator choice (XSim, Verilator, Questa).
 8. Beta is hard-coded as 19/20.
 9. Add an argmax tie test vector.
-10. The repository reorganization commit has not been pushed.
+10. (Resolved) The repository reorganization and the LIF correction are on `origin/main`.
