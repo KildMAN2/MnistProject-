@@ -1272,6 +1272,172 @@ vsim -c work.tb_l1_neuron_engine -do "run -all; quit -f"
 synthesised yet. The pixel RAM, weight ROM and `l1_mac` are not yet optimised for
 a target device.
 
+# RTL Milestone 6 — Full Layer-1 Current Sweep and Cache
+
+Files: `fpga/rtl/cur1_ram.sv`, `fpga/rtl/l1_current_sweep.sv`,
+`fpga/scripts/generate_l1_sweep_vectors.py`, `fpga/tb/tb_l1_current_sweep.sv`,
+`fpga/tb/vectors/l1s_images.txt`, `fpga/tb/vectors/l1s_expected.txt`.
+Scope: the integer `Linear(784 -> 256)` only. No LIF, no spikes, no layer 2, no
+time-step loop.
+
+**Why cur1 is cached.** The image pixels, the layer-1 weights and the layer-1
+biases are all static during the 25 time steps, so
+`cur1[j] = bias1[j] + sum_i pixel[i]*weight1[j][i]` does not depend on the time step
+(verified in Milestone 3 on the real `Int16SNN`, t = 0..24). Computing the dense
+dot products once per image and letting the 25 LIF steps READ the cache avoids
+24 x 200,704 repeated multiply-accumulates. This is a scheduling optimisation only
+and changes no value. No time-step loop is built around the sweep.
+
+**cur1 RAM.** `cur1_ram #(WIDTH=35, DEPTH=256, ADDR_WIDTH=8)`: write port
+(`we`, `waddr`, `wdata`) and synchronous read port (`raddr`, `rdata <= mem[raddr]`,
+1-cycle latency: address before edge N, data after edge N). It stores raw 35-bit
+two's-complement bits; consumers interpret them with `$signed`. Vendor-neutral
+inferred RAM (256 x 35 = 8,960 bits). Read-during-write is not used and not
+defined. It is NOT cleared by reset (see "New image" below).
+
+**Sweep interface.** `clk`, `rst`, the pixel load port (`pixel_we`, `pixel_waddr`,
+`pixel_wdata`, passed up from the single engine's pixel buffer), `start`, `busy`,
+`done` (one-clock registered pulse), `cur1_raddr[7:0]`, `cur1_rdata[34:0]`.
+`start` is accepted only when `busy = 0`. The sweep instantiates ONE
+`l1_neuron_engine` and one `cur1_ram`; it does not duplicate the pixel buffer,
+the weight addressing or the MAC.
+
+**Controller.** `S_IDLE -> S_KICK -> S_WAIT -> S_IDLE`.
+
+```
+IDLE : start accepted -> nidx <= 0
+KICK : engine start for neuron 0 (engine is idle, accepts at this edge)
+WAIT : engine done pulse seen:
+         cur1[nidx] <= current_out        (write uses the OLD nidx)
+         nidx != 255 : start neuron nidx+1 at this same edge, nidx <= nidx+1
+         nidx == 255 : state <= IDLE, done <= 1
+```
+
+```
+j=0
+ |  run engine
+ v
+store cur1[0]
+ |
+j=1 -> run engine -> store cur1[1] -> ... -> j=255 -> run engine
+ |
+store cur1[255]
+ |
+done
+```
+
+```
+                 one l1_neuron_engine
+                          |
+                     current_out
+                          |
+                          v
+                +------------------+
+                |    cur1 RAM      |
+                | 256 x 35 bits    |
+                +------------------+
+                          ^
+                          |
+                write address = j
+```
+
+**Cache write timing.** The engine's `done` pulse is registered and visible in the
+cycle after the edge that returns the engine to IDLE, so in the done cycle the
+engine is already idle and `current_out` is final. Combinationally in that cycle:
+`cur1_we = (state==WAIT) && eng_done`, `cur1_waddr = nidx`,
+`cur1_wdata = current_out`. At the closing edge, with nonblocking assignments, the
+RAM captures the old `nidx` and `nidx <= nidx+1` takes effect afterwards, so the
+write goes to the right address.
+
+**Next-neuron start timing.** Because the engine is already idle in its done cycle,
+the sweep issues the next `start` (with `neuron_index = nidx+1`) in that same
+cycle, and the engine accepts it at the same edge that stores the previous result.
+The engine was not modified. The registered sweep `done` becomes visible one clock
+after the last write, so the cache is completely written when `done` is seen.
+
+**Measured latency.** Per neuron 786 clocks (engine, accepted start to done
+visible) + 1 (the done cycle during which the next start is accepted) = **787
+clocks per neuron**, i.e. an inter-neuron overhead of 1 clock. Total from the
+accepted sweep start edge to sweep `done` visible:
+
+```
+1 (KICK) + 256 x 787 = 201,473 clocks   (measured: 201,473 on all 9 sweeps)
+```
+
+Hypothetical 100 MHz clock (NOT verified, nothing is synthesised): 201,473 x 10 ns
+= 2.01 ms per image for layer 1.
+
+**Synchronous cache read.** Tested after each sweep: directed addresses 0, 1, 2,
+127, 128, 254, 255; all 256 entries one by one; a mid-cycle check that the output
+still holds the old address' data until the next edge; and a back-to-back stream
+over all 256 addresses checking old data before and new data after each edge. This
+is the access pattern the future layer-1 LIF stage will use.
+
+**New image / reset.** Reset clears the controller (state, index, done), not the
+RAM: a new sweep overwrites all 256 entries before anything reads them. The
+testbench proves it by running image 0 again after the all-255 image (no stale
+values remain) and by aborting a sweep with a reset in flight, then loading and
+sweeping again.
+
+**Start while busy.** A `start` while busy is ignored. The testbench injects extra
+starts during neuron 0, in the middle of the sweep, during neuron 255 and near the
+end; the neuron sequence, write sequence and cache stay correct.
+
+**Golden vectors.** `generate_l1_sweep_vectors.py`: full `cur1[256] = pixels @
+W1.T + b1` in int64 from the real exported int16 weights / int32 biases and real
+MNIST test images 0, 1, 2, 3 plus an all-zero and an all-255 image (raw bytes
+asserted equal to `round(float*255)`); all 256 currents of each real image are
+cross-checked against the layer-1 current fed to the LIF by `Int16SNN`. 1,536
+expected currents, range -401,001,624 ... 241,297,976 (fits signed 35 bits).
+
+**Testbench monitors.** On every cache write (at the moment it occurs): exactly
+256 writes per sweep, addresses 0..255 in order exactly once each (no duplicate, no
+missing, none > 255), and write data equal to the golden `cur1[j]`. On the engine:
+the accepted neuron sequence 0..255 exactly once, 256 done pulses, sweep `done` is
+exactly one clock, `busy` stays high until done, and the latency is 201,473. After
+each sweep all 256 cache entries are read back and compared.
+
+**ModelSim results (actually run, Intel FPGA Edition 10.5b).**
+
+```
+cd fpga\tb
+vlog -sv ..\rtl\snn_params_pkg.sv ..\rtl\sync_rom.sv ..\rtl\pixel_buffer.sv ^
+         ..\rtl\l1_mac.sv ..\rtl\l1_neuron_engine.sv ..\rtl\cur1_ram.sv ^
+         ..\rtl\l1_current_sweep.sv tb_l1_current_sweep.sv
+vsim -c work.tb_l1_current_sweep -do "run -all; quit -f"
+  sweeps                       : 9  (images 0,1,2,3, zero, 255, 0 again, 2 with start-spam, 3 after reset)
+  complete neuron calculations : 2,304
+  MAC products represented     : 1,806,336 (= 2,304 x 784)
+  cache writes                 : 2,304   failures 0
+  write-address checks         : 2,304
+  write-data checks            : 2,304
+  engine start-sequence checks : 2,304   failures 0
+  cache read-back checks       : 2,367   failures 0
+  cache read-latency checks    : 18      failures 0
+  back-to-back read checks     : 4,590   failures 0
+  sweep latency                : 201,473 clocks (min = max)
+  total failures               : 0       PASS
+```
+
+**Intentional breaks** (temporary mutants, deleted, never committed):
+
+| Break | Failures detected |
+|---|---|
+| skip neuron 128 | 2,358 |
+| neuron 127 processed twice | 524 |
+| write address = neuron + 1 | 9,279 |
+| store current one cycle too early | 1,031 |
+| stop after 255 currents | 63 |
+| accept a second sweep start while busy | 903 |
+| wrong cache write data (+1) | 9,279 |
+| cache read checked one clock early (`-GEARLY=1`) | 2,123 |
+
+**Notes.** The engine/sweep is the correctness version: every neuron re-reads the
+pixel buffer and weight ROM through single-ported inferred memories, with a
+single-stage multiply-add. About 201k clocks per image for layer 1 dominates the
+total (see Schedule). Nothing is synthesised, so timing, DSP and block RAM mapping
+remain open.
+
 # Open Items (to resolve before RTL)
 
 1. Target FPGA device and BRAM capacity (~100 RAMB36 needed). **Open.**
