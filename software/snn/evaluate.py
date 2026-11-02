@@ -8,8 +8,9 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from dataset import get_mnist_loaders
-from model import MNISTSNN, count_output_spikes
+from software.paths import DATA_DIR, DEFAULT_CHECKPOINT
+from software.snn.dataset import get_mnist_loaders
+from software.snn.model import MNISTSNN, count_output_spikes
 
 
 def evaluate(
@@ -55,10 +56,10 @@ def main() -> None:
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=Path("mnist_snn_static.pt"),
+        default=DEFAULT_CHECKPOINT,
         help="best-validation checkpoint produced by train.py",
     )
-    parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument(
         "--examples",

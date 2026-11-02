@@ -7,16 +7,21 @@ from pathlib import Path
 
 import torch
 
-from dataset import get_mnist_loaders
-from model import MNISTSNN, count_output_spikes
-from quantization import Int16SNN, export_quantized_model, quantized_spike_counts
+from software.paths import DATA_DIR, DEFAULT_CHECKPOINT, INT16_DIR
+from software.quantization.quantization import (
+    Int16SNN,
+    export_quantized_model,
+    quantized_spike_counts,
+)
+from software.snn.dataset import get_mnist_loaders
+from software.snn.model import MNISTSNN, count_output_spikes
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", type=Path, default=Path("mnist_snn_static.pt"))
-    parser.add_argument("--export-dir", type=Path, default=Path("int16_export"))
-    parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
+    parser.add_argument("--export-dir", type=Path, default=INT16_DIR)
+    parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--examples", type=int, default=5)
     args = parser.parse_args()

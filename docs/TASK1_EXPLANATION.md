@@ -1,4 +1,4 @@
-# Task 1 — Spiking Neural Network for MNIST
+﻿# Task 1 â€” Spiking Neural Network for MNIST
 
 ## 1. Goal of Task 1
 
@@ -17,26 +17,25 @@ implementation and its verification against this quantized Python reference.
 
 Project files:
 
-- `dataset.py`: separate torchvision MNIST training and test datasets and
+- `software/snn/dataset.py`: separate torchvision MNIST training and test datasets and
   their DataLoaders.
-- `model.py`: configurable SNN, static current presentation, LIF simulation,
+- `software/snn/model.py`: configurable SNN, static current presentation, LIF simulation,
   optional membrane recording, spike counting, and prediction.
-- `snn_model.py`: compatibility imports for the earlier module name.
-- `lif_demo.py`: five-step numerical example using the same snnTorch LIF
+- `software/snn/lif_demo.py`: five-step numerical example using the same snnTorch LIF
   configuration as the network.
-- `train.py`: training, validation-based checkpoint selection, and test
+- `software/snn/train.py`: training, validation-based checkpoint selection, and test
   evaluation after training.
-- `evaluate.py`: full test-set inference with example predictions and spike
+- `software/snn/evaluate.py`: full test-set inference with example predictions and spike
   count debugging output.
-- `quantization.py`: per-layer signed-int16 weight quantization, int32
+- `software/quantization/quantization.py`: per-layer signed-int16 weight quantization, int32
   accumulator-domain bias export, metadata, and explicit integer-only
   inference.
-- `quantize_and_compare.py`: export quantized layer files and compare
+- `software/quantization/quantize_and_compare.py`: export quantized layer files and compare
   floating-point and int16-weight inference accuracy over the test set.
-- `int16_export/`: generated NumPy arrays and JSON dimensions/scales for
+- `artifacts/int16/`: generated NumPy arrays and JSON dimensions/scales for
   hardware use.
 - `requirements.txt`: Python package dependencies.
-- `TASK1_EXPLANATION.md`: this technical explanation.
+- `docs/TASK1_EXPLANATION.md`: this technical explanation.
 
 ## 2. What MNIST Is
 
@@ -221,7 +220,7 @@ Numerical example (`beta=0.95`, threshold 1.0, initial membrane 0):
 | 5 | 0.6000 | 0.553425 | 0.525754 | 1.125754 | 1 | 0.125754 |
 
 At steps 2 and 5, input plus retained membrane exceeds the threshold, so a
-spike occurs and 1.0 is subtracted. `py lif_demo.py` runs this example through
+spike occurs and 1.0 is subtracted. `py -m software.snn.lif_demo` runs this example through
 the actual snnTorch LIF implementation and checks the state updates.
 
 ## 10. Time Steps
@@ -426,12 +425,12 @@ checkpoint on the complete official test set reported **97.13% accuracy
 (9,713 / 10,000)**. The `evaluate.py` run was repeated independently and
 returned the same correct count, total, and percentage. The prior **96.65%
 (9,665 / 10,000)** result belongs to the previous stochastic rate-coded model
-and checkpoint `mnist_snn.pt`, not the current static-current architecture.
+and checkpoint `artifacts/checkpoints/mnist_snn.pt`, not the current static-current architecture.
 
 To reproduce evaluation:
 
 ```powershell
-py evaluate.py --checkpoint mnist_snn_static.pt
+py -m software.snn.evaluate --checkpoint artifacts/checkpoints/mnist_snn_static.pt
 ```
 
 The best checkpoint is selected using validation accuracy; the official test
@@ -463,16 +462,16 @@ matrix shapes are `[256, 784]` and `[10, 256]`; bias shapes are `[256]` and
 `784 * hidden_size + 10 * hidden_size`, biases are `hidden_size + 10`.
 
 The best-selected floating-point values are saved in
-`mnist_snn_static.pt` under `model_state_dict`, along with `hidden_size`,
+`artifacts/checkpoints/mnist_snn_static.pt` under `model_state_dict`, along with `hidden_size`,
 `beta`, `threshold`, `num_steps`, epoch, training metrics, and validation
 accuracy. In the verified run the checkpoint came from epoch 4, with
 validation accuracy 96.98%; its parameters are float32 PyTorch tensors. The
 test accuracy of that checkpoint is 97.13% (9,713 / 10,000). The earlier
-`mnist_snn.pt` is a rate-coded checkpoint and should not be used as if it were
+`artifacts/checkpoints/mnist_snn.pt` is a rate-coded checkpoint and should not be used as if it were
 trained with the present static-current input method.
 
 `quantize_and_compare.py` exports quantized weights, scale factors, biases,
-and dimensions to `int16_export/`, then compares floating-point and explicit
+and dimensions to `artifacts/int16/`, then compares floating-point and explicit
 integer inference on the full test split. The saved float checkpoint remains
 the training artifact; the exported int16 weights and integer inference are
 the hardware-oriented inference artifacts.
@@ -501,7 +500,7 @@ It will need to:
 5. Count each of the 10 output spikes for all time steps and implement
    argmax with the same lowest-index tie rule as PyTorch.
 6. Load the signed-int16 layer weights and scales exported under
-   `int16_export/`; use the int32 accumulator-domain biases and their scales
+   `artifacts/int16/`; use the int32 accumulator-domain biases and their scales
    from the same directory.
 7. Match the explicit integer reference's pixel coding, integer accumulators,
    beta rounding, threshold quantization, comparison and reset rules.
@@ -522,7 +521,7 @@ reference, but it does not yet include SystemVerilog.
 
 PyTorch gradient-based training relies on differentiable floating-point
 parameters. The backward pass computes small gradients and Adam updates these
-parameters repeatedly. The trained checkpoint `mnist_snn_static.pt` therefore
+parameters repeatedly. The trained checkpoint `artifacts/checkpoints/mnist_snn_static.pt` therefore
 stores float32 shadow/training weights. These are not the final hardware
 weights.
 
@@ -552,8 +551,8 @@ W_approx = q_int16 * scale
 ```
 
 In code, `quantization.py` implements per-layer conversion, verifies integer
-type and range, and exports scale metadata. `int16_export/layer1_weights_int16.npy`
-and `int16_export/layer2_weights_int16.npy` hold the actual int16 arrays, not
+type and range, and exports scale metadata. `artifacts/int16/layer1_weights_int16.npy`
+and `artifacts/int16/layer2_weights_int16.npy` hold the actual int16 arrays, not
 float-cast weights.
 
 ### Numerical example
@@ -562,14 +561,14 @@ Suppose one layer has `max(abs(W)) = 0.20` and one weight is `W_i = -0.075`:
 
 ```text
 scale = 0.20 / 32767
-      ≈ 0.0000061037
+      â‰ˆ 0.0000061037
 
 q_i = round(-0.075 / 0.0000061037)
     = round(-12287.625...)
     = -12288
 
 W_approx_i = -12288 * 0.0000061037
-           ≈ -0.0750023
+           â‰ˆ -0.0750023
 ```
 
 The small difference `W_approx_i - W_i` is quantization error. With this
@@ -638,7 +637,7 @@ Therefore float accuracy cannot be assumed to equal int16-weight accuracy.
 Run the end-to-end export and comparison:
 
 ```powershell
-py quantize_and_compare.py --checkpoint mnist_snn_static.pt
+py -m software.quantization.quantize_and_compare --checkpoint artifacts/checkpoints/mnist_snn_static.pt
 ```
 
 The script evaluates both the original float SNN and the separate integer
@@ -689,7 +688,7 @@ the exported weight format. Layer 1 uses integer pixel codes in [0, 255] and
 `input_scale = 1`.
 
 The full test-set comparison using the current checkpoint and files under
-`int16_export/` produced:
+`artifacts/int16/` produced:
 
 | Verification | Result |
 |---|---:|

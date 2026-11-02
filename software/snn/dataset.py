@@ -7,10 +7,12 @@ from pathlib import Path
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
+from software.paths import DATA_DIR
+
 
 def get_mnist_loaders(
     batch_size: int = 128,
-    data_dir: str | Path = "data",
+    data_dir: str | Path = DATA_DIR,
 ) -> tuple[DataLoader, DataLoader]:
     """Create separate shuffled training and ordered test MNIST loaders.
 

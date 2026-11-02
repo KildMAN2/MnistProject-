@@ -6,7 +6,7 @@ import torch
 import snntorch as snn
 from snntorch import surrogate
 
-from snn_model import BETA, THRESHOLD
+from software.snn.model import DEFAULT_BETA as BETA, DEFAULT_THRESHOLD as THRESHOLD
 
 
 INPUT_CURRENTS = (0.6, 0.6, 0.0, 0.4, 0.6)

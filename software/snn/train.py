@@ -11,8 +11,9 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, random_split
 
-from dataset import get_mnist_loaders
-from model import (
+from software.paths import DATA_DIR, DEFAULT_CHECKPOINT
+from software.snn.dataset import get_mnist_loaders
+from software.snn.model import (
     DEFAULT_BETA,
     DEFAULT_HIDDEN_SIZE,
     DEFAULT_NUM_STEPS,
@@ -132,9 +133,9 @@ def main() -> None:
     parser.add_argument("--hidden-size", type=int, default=DEFAULT_HIDDEN_SIZE)
     parser.add_argument("--beta", type=float, default=DEFAULT_BETA)
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
-    parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
     parser.add_argument(
-        "--output", type=Path, default=Path("mnist_snn_static.pt")
+        "--output", type=Path, default=DEFAULT_CHECKPOINT
     )
     args = parser.parse_args()
 
