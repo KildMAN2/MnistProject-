@@ -1716,6 +1716,116 @@ hidden_spikes[j]
 bias2[k] --sext 33--> accumulator --> cur2[k]       j = 0..255, then k = 0..9
 ```
 
+# RTL Milestone 9 — Layer-2 LIF and Output Spikes
+
+Files: `fpga/rtl/l2_lif_sweep.sv`, `fpga/scripts/generate_l2_lif_vectors.py`,
+`fpga/tb/tb_l2_lif_sweep.sv` and three vector files `l2l_*.txt`. No spike counters,
+global 25-step controller, argmax or top level are included.
+
+## What it does
+
+`l2_lif_sweep` performs ONE Layer-2 LIF time step for the 10 output neurons. For
+k = 0..9, strictly in order and with ONE shared `lif_core` (MEM_WIDTH = `L2_MEM_WIDTH` 36,
+CUR_WIDTH = `L2_ACC_WIDTH` 33, THRESHOLD = `L2_THRESHOLD` 164,691; no LIF equation is
+duplicated and `lif_core` is unchanged):
+
+```
+{mem2_new[k], spike} = lif_core(mem2[k], cur2[k])       (strict ">" everywhere)
+mem2[k] <= mem2_new[k];  output_spikes[k] <= spike
+```
+
+```
+              cur2[k]  (signed 33)
+                 |
+                 v
+           +-----------+
+mem2[k] -->| lif_core  |--> output_spike[k] --> output_spikes[k]
+ (36)      +-----------+
+                 |
+                 v
+            mem2_new[k]
+                 |
+                 +-----> mem2[k] register        k = 0..9, then repeat per SNN time step
+```
+
+## State, interface, controller
+
+- `mem2` is a 10 x 36 = 360-bit register array (`logic signed [35:0] mem2 [0:9]`). Only ten
+  membranes exist, so no RAM is used; the combinational `lif_core` reads the register
+  array directly, so there is no memory latency to align.
+- Ports: `clk, rst, clear_state, clear_done, start_step, busy, step_done`,
+  `cur2[0:9]` (signed 33-bit, explicitly typed, stable from `start_step` to `step_done`),
+  `output_spikes[9:0]` (spikes of the last completed step, all ten bits rewritten every step).
+- States: `IDLE, CLEAR, UPD`. Commands while busy are ignored; `clear_state` wins over a
+  simultaneous `start_step`.
+- `clear_state`: sequentially writes mem2[0..9] = 0 and clears `output_spikes`.
+  Membranes are cleared ONCE per image, never between time steps, so the stored
+  `mem2_new` of step t is the `mem2_old` of step t+1.
+- Reset clears the controller, `output_spikes` AND all mem2 registers (cheap for 360 flops).
+  The top level must still issue `clear_state` at the start of every inference.
+- Measured latencies (confirmed by the testbench in every operation):
+  **clear = 10 clocks, step = 10 clocks** from the accepting edge to the done pulse. E(k+1)
+  writes neuron k; the last write (k = 9) and the registered done pulse occur at E10, so when
+  `step_done`/`clear_done` is first seen all ten membranes and spikes are final.
+- Signedness: `cur2` is a signed 33-bit port and `lif_core` sign-extends it; negative
+  currents are exercised on the real path (negative cur2 values and negative membranes).
+
+## Golden vectors
+
+`generate_l2_lif_vectors.py` spies on the real `Int16SNN._lif_step` during the actual forward
+pass and captures, for MNIST 0, MNIST 1, an all-zero and an all-255 image (25 steps each),
+the layer-1 hidden spikes and the layer-2 (membrane_in, current, membrane_out, spikes,
+threshold). It asserts that the layer-2 threshold is the golden `threshold2`, that the
+captured trajectory equals a replay of the real `_lif_step` starting from mem2 = 0, and that
+the captured current equals `hidden_spikes @ W2.T + b2`. Output spikes per image over 25 steps:
+19, 16, 1, 30. It also exports 1,000 directed (membrane, current) cases produced by the real
+`_lif_step`: membrane at threshold-1/threshold/+1, pre-spike exactly at threshold-1/threshold/+1,
+positive and negative membrane and current (407 negative membranes, 454 negative currents),
+prev_reset 0/1 (221 cases with 1), spike 0/1 (204 spikes) and 404 decay tie cases.
+
+## ModelSim result (Intel FPGA Edition 10.5b)
+
+`tb_l2_lif_sweep` instantiates the REAL `l2_current_engine` and `l2_lif_sweep` together:
+hidden spikes -> hardware cur2 -> hardware LIF, per time step; `clear` before each image only.
+
+| Check | Count | Failures |
+|---|---|---|
+| Images (4 + image 0 repeated after a mid-step reset and a clear) | 5 | 0 |
+| Time steps | 125 | 0 |
+| `l2_current_engine` runs (each 2,590 clocks, as in milestone 8) | 126 | 0 |
+| Output LIF neuron updates (4 required images = 1,000) | 1,250 | 0 |
+| Membrane input / hardware cur2 / membrane output / spike comparisons | 1,250 each | 0 |
+| Output-neuron order 0..9 (no skip, no duplicate), 10 writes per step | 1,250 / 125 | 0 |
+| `step_done` only after the last write | 125 | 0 |
+| Clear operations (membranes and spikes zero at `clear_done`) | 5 (+6 on the directed DUT) | 0 |
+| Clear latency (measured min = max) | 10 clocks | 0 |
+| Step latency (measured min = max) | 10 clocks | 0 |
+| Busy checks / commands ignored while busy (k=0, middle, k=9) | 1,170 / 8 | 0 |
+| Reset (idle, spikes zero, mem2 zero) | 5 | 0 |
+| Directed integration cases | 1,000 | 0 |
+
+Total mismatches: 0.
+
+### Intentional breaks (all caught, then removed)
+
+| # | Mutant | Failures |
+|---|---|---|
+| 1 | cur2 index k+1 | 5,261 |
+| 2 | skip output neuron 5 | 1,109 |
+| 3 | output neuron 4 twice | 83 |
+| 4 | cur2 interpreted unsigned | 4,265 |
+| 5 | membrane interpreted unsigned | 3,590 |
+| 6 | membrane cleared every step | 4,708 |
+| 7 | spike written to k+1 | 472 |
+| 8 | `>=` instead of `>` (mutated `lif_core` copy) | 32 |
+| 9 | `step_done` one cycle early | 546 |
+| 10 | clear only 9 membranes | 249 |
+| 11 | `output_spikes` not cleared on clear | 8 |
+| 12 | wrong L2 threshold (+1) | 885 |
+
+(A first version of mutant 9 set `step_done` at the same edge as the correct design, so it
+changed nothing and passed; it was corrected to k = 8 and then caught.)
+
 # Open Items (to resolve before RTL)
 
 1. Target FPGA device and BRAM capacity (~100 RAMB36 needed). **Open.**
