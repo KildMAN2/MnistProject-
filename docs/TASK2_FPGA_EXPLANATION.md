@@ -1574,6 +1574,148 @@ Total failures: 0. Measured latencies: clear 256, one step 512.
 (A first version of mutant 8 left its state flag uninitialised, made no change and
 passed; it was corrected and then caught.)
 
+# RTL Milestone 8 — Layer-2 Current Engine
+
+Files: `fpga/rtl/l2_acc.sv`, `fpga/rtl/l2_current_engine.sv`,
+`fpga/scripts/generate_l2_current_vectors.py`, `fpga/tb/tb_l2_acc.sv`,
+`fpga/tb/tb_l2_current_engine.sv`. No Layer-2 LIF, mem2, output spike counters,
+global controller, argmax or top level are included.
+
+## Equation and why there is no multiplier
+
+```
+cur2[k] = bias2[k] + sum_{j=0..255} hidden_spike[j] * weight2[k][j]      k = 0..9
+```
+
+`hidden_spike[j]` is exactly 0 or 1, so the product is either `weight2[k][j]` or 0:
+a conditional add. No multiplier (and no DSP) is needed.
+
+## Numeric types and width
+
+| Item | Type | Range |
+|---|---|---|
+| weight2 | signed 16 bit | -32768 .. 32767 |
+| bias2 | signed 32 bit | int32 |
+| accumulator | signed 33 bit (`L2_ACC_WIDTH`) | -2^32 .. 2^32-1 |
+
+Worst-case generic bound: `max = 2^31-1 + 256*32767 = 2,155,871,999` and
+`min = -2^31 - 256*32768 = -2,155,872,256`. Both exceed the int32 range, so 32 bits
+are not enough, and both lie inside the signed 33-bit range, so 33 are. `l2_acc`
+checks this at elaboration (`$fatal` otherwise). Weight and bias are explicitly
+sign-extended to 33 bits; there is no saturation. The real network values are
+far smaller (measured cur2 range in the vectors: -459,238 .. 170,218).
+
+## `l2_acc` (primitive)
+
+`load_bias`: `acc <= sext(bias)`. `valid` means "consume one hidden index":
+`spike=1` adds `sext(weight)`, `spike=0` leaves `acc` unchanged, and in both cases
+`result_valid` is set after the edge. Priority `rst > load_bias > valid`. The block
+does not count inputs.
+
+## ROM layout and addressing
+
+`layer2_weights.mem` is row-major `[10][256]`: `addr = k*256 + j`. Because 256 is a
+power of two the address is the concatenation `{k[3:0], j[7:0]}` (12 bits), i.e.
+`base = k << 8`, with no multiplier. Bias ROM address = k.
+
+## Engine (`l2_current_engine`)
+
+Ports: `clk, rst, start, hidden_spikes[255:0]` (stable from start to done), outputs
+`busy, done` (registered one-clock pulse) and `cur2[0..9]` (ten signed 33-bit
+registers; not reset, because a complete run overwrites all ten before `done`).
+`start` while busy is ignored. Reset clears the controller, the indices and the
+accumulator. One `l2_acc` is reused for all ten outputs.
+
+States: `IDLE, BIAS, LOAD, RUN, DRAIN, STORE`.
+
+### Timeline for one output neuron k (E0 = accepting edge)
+
+| Edge | State | What happens |
+|---|---|---|
+| E0 | IDLE | start accepted; k=0, j=0 |
+| E1 | BIAS | bias ROM captures bias[k] (weight ROM captures {k,0}, unused) |
+| E2 | LOAD | `load_bias` (bias valid since E1); ROM captures {k,0}; `spk_d <= hidden_spikes[0]`; `v1 <= 1`; j <= 1 |
+| E3 | RUN | acc consumes index 0 (weight[k][0] with spike[0]); ROM captures {k,1}, `spk_d <= hidden_spikes[1]` |
+| E(2+j) | RUN | ROM captures {k,j}, `spk_d <= hidden_spikes[j]` |
+| E(3+j) | RUN | acc consumes index j |
+| E257 | RUN | ROM captures {k,255}, `spk_d <= hidden_spikes[255]`; j == 255 -> DRAIN |
+| E258 | DRAIN | acc consumes index 255; acc final after E258 |
+| E259 | STORE | `cur2[k] <= acc_out`; k<9: k <= k+1, j <= 0 -> BIAS (next E1 = E260); k=9: `done <= 1` -> IDLE |
+
+Because the ROM output is registered, the spike is delayed with the same registers
+(`spk_d`, `v1`) as the ROM data, so weight2[k][j] always meets hidden_spikes[j], never
+the already-advanced index. The next output is started only after `cur2[k]` has been
+stored (STORE), never earlier.
+
+### Measured latency
+
+**2,590 clocks** from the accepting edge to `done` visible, constant in all runs
+(min = max = 2,590). It is 10 outputs x 259 clocks, with 259 = 1 (bias ROM) + 1
+(bias load) + 255 (RUN edges; the first index is consumed in the next RUN edge, so the
+issue of every address overlaps the previous consume) + 1 (drain) + 1 (store). When
+`done` is first seen, `cur2[0..9]` are already final.
+
+## Golden vectors
+
+`generate_l2_current_vectors.py` takes the hidden spikes of every step from the REAL
+`Int16SNN` forward run (spy on the layer-1 `_lif_step`) for MNIST 0, MNIST 1, an
+all-zero and an all-255 image, 25 steps each (100 vectors, 75 with at least one
+spike), computes `hidden_spikes @ weights2.T + biases2` in int64 and asserts equality
+with the layer-2 current actually passed into `Int16SNN._lif_step` (1,000 outputs).
+It adds 88 directed vectors: all-zero (result must be bias2), all-one (bias2 + row
+sums), single spike at 0/127/128/255, 1010… and 0101…, 40 sparse (5%) and 40 dense
+(70%) random vectors. Total 188 vectors, 1,880 expected currents.
+
+## ModelSim result (Intel FPGA Edition 10.5b)
+
+| Check | Count | Failures |
+|---|---|---|
+| Primitive `l2_acc` tests (`tb_l2_acc`) | 5,241 (+5,032 `result_valid` checks) | 0 |
+| Engine runs | 190 (188 vectors + 2 after a mid-run reset) | 0 |
+| Images / time steps / real vectors | 4 / 25 / 100 (= 1,000 real output currents) | 0 |
+| Layer-2 current comparisons (all runs) | 1,900 | 0 |
+| Input-consumption operations (2,560 per run) | 486,400 | 0 |
+| Weight-address issue checks (k*256+j in order) | 486,400 | 0 |
+| Spike/weight alignment at every consume | 486,400 | 0 |
+| Bias address checks | 1,900 | 0 |
+| Per-run counts (2,560 consumes, 2,560 issues, 10 biases, one `done`) | 190 | 0 |
+| Latency (2,590) | 190 | 0 |
+| start-while-busy pulses (output 0, middle, output 9) | 12 | 0 |
+| Reset mid-run (idle, accumulator 0, later run correct) | 1 | 0 |
+
+Total mismatches: 0.
+
+### Intentional breaks (all caught, then removed)
+
+| # | Mutant | Engine-TB failures |
+|---|---|---|
+| 1 | weight ROM address +1 | 487,850 |
+| 2 | wrong output base (k<<7) | 876,996 |
+| 3 | hidden-spike delay missing | 1,620 |
+| 4 | weight unsigned (also `tb_l2_acc`: 4,194) | 1,620 |
+| 5 | spike=0 still adds (also `tb_l2_acc`: 4,284) | 1,880 |
+| 6 | skip hidden index 128 | 921,310 |
+| 7 | hidden index 127 twice | 4,867 |
+| 8 | only 255 inputs | 872,830 |
+| 9 | 257 inputs | 880,050 |
+| 10 | bias forgotten | 1,900 |
+| 11 | cur2 stored to k+1 | 1,900 |
+| 12 | `done` one cycle early | 736 |
+
+Diagram:
+
+```
+hidden_spikes[j]
+  |
+  +--- 1 ----------------+
+  |                      |
+  |                signed weight2[k][j]  (ROM, 1-cycle latency; spike delayed to match)
+  |                      |
+  +--- 0 -> add 0        |
+                         v
+bias2[k] --sext 33--> accumulator --> cur2[k]       j = 0..255, then k = 0..9
+```
+
 # Open Items (to resolve before RTL)
 
 1. Target FPGA device and BRAM capacity (~100 RAMB36 needed). **Open.**
