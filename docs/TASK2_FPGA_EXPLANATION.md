@@ -1826,6 +1826,118 @@ Total mismatches: 0.
 (A first version of mutant 9 set `step_done` at the same edge as the correct design, so it
 changed nothing and passed; it was corrected to k = 8 and then caught.)
 
+# RTL Milestone 10 — Output Spike Counters
+
+Files: `fpga/rtl/output_spike_counters.sv`, `fpga/scripts/generate_output_count_vectors.py`,
+`fpga/tb/tb_output_spike_counters.sv`, vectors `oc_steps.txt`, `oc_final.txt`, `oc_hs.txt`.
+Argmax, the global 25-step controller and `snn_top` are NOT part of this milestone.
+
+## Why spike counts
+
+The golden `Int16SNN` classifies with `counts[k] = sum over t=0..24 of output_spike[t][k]`
+followed by `argmax(counts)`. A single time step carries almost no information (one or no output
+neuron spikes); the rate over 25 steps is the class evidence. The counters accumulate this.
+
+## Width: 5 bits
+
+There are NUM_STEPS = 25 time steps and an output neuron spikes at most once per step, so
+0 <= count <= 25. 2^4 = 16 < 26 <= 32 = 2^5, hence `SPIKE_COUNT_WIDTH = 5` (unsigned, from
+`snn_params_pkg`). There is no saturation: a valid inference issues exactly 25 count pulses.
+
+## Design
+
+```
+output_spikes[9:0]
+        |
+        |   count_enable (ONE-clock pulse per completed time step)
+        v
++--------------------------+
+| counter 0   5 bits       |
+| counter 1   5 bits       |
+| ...                      |
+| counter 9   5 bits       |
++--------------------------+
+        |
+        v
+counts[0..9]        after 25 pulses: counts[k] = total spikes of output neuron k
+```
+
+- Ten counters update in PARALLEL in one clocked `always_ff`; nothing is serialized.
+- Interface: `clk, rst, clear_counts, count_enable, output_spikes[9:0]` and
+  `counts[0:9]` (unpacked array of 5-bit values, ready for the future argmax).
+- Priority: `rst` > `clear_counts` > `count_enable`. `clear_counts` and `count_enable` on the
+  same edge give all zeros. Reset also zeroes all counters (cheap); the future controller still
+  issues `clear_counts` once per inference.
+- Exactly once per time step: `output_spikes` stays high after `l2_lif_sweep.step_done`, so a
+  level must never be counted. The block does not know `step_done`; it only reacts to the
+  one-clock `count_enable` pulse. The future controller turns the Layer-2 completion event into
+  that single pulse. Holding the spike vector for several clocks with `count_enable` low (or high
+  for one clock) increments only once; this is tested.
+- Clock semantics: the counters update at the edge where `count_enable` is sampled; the
+  testbench compares #1 after that edge, so it sees the updated registers.
+
+## Golden vectors
+
+`generate_output_count_vectors.py` spies on the real `Int16SNN._lif_step` during the actual
+forward pass of MNIST test images 0..19 plus an all-zero and an all-255 image (22 images x 25
+steps). It exports the output spikes of every step, the cumulative counts after every step, the
+final counts and the Python argmax prediction (for the future argmax milestone; first maximum on
+ties, 1 of 22 images has an argmax tie: the all-255 image, counts 9 at outputs 2 and 5, prediction 2). The summed spikes
+equal `quantized_spike_counts(Int16SNN(x))` for every image. The predictions of images 0..19
+equal the MNIST labels. The hidden spikes of 6 images (MNIST 0..3, zero, 255) are exported for the
+integration test.
+
+## ModelSim result (Intel FPGA Edition 10.5b)
+
+| Check | Count | Failures |
+|---|---|---|
+| Images / time steps / count_enable pulses (golden) | 22 / 550 / 550 | 0 |
+| Golden cumulative-count comparisons (22 x 25 x 10 = 5,500, plus 220 final) | 5,720 | 0 |
+| Model-compared counter values, all phases (2,273 pulses, 4,094 clocks) | 43,380 | 0 |
+| Directed checks (all-zero, all-one, single 0 / 9, walking, alternating, 200 random) | 228 | 0 |
+| Exactly 25 all-one pulses: all ten counters = 25 | 10 | 0 |
+| Enable-low hold checks (spikes held with count_enable low) | 24 | 0 |
+| Clear tests (mid-image clear then continue from zero) | 4 | 0 |
+| Clear-priority tests (clear + enable + all ones) | 4 | 0 |
+| Reset tests | 4 | 0 |
+| Random cycles (random spikes, enable, clear) | 3,000 | 0 |
+| Maximum observed count in valid-inference tests | 25 | - |
+
+Total mismatches: 0.
+
+### Integration with the real Layer 2 (`l2_current_engine` + `l2_lif_sweep` + counters)
+
+Flow per image: clear Layer-2 state and counters; for t = 0..24: hidden spikes ->
+`l2_current_engine` (2,590 clocks) -> `l2_lif_sweep` -> one `count_enable` pulse after
+`step_done` -> compare the counts with the cumulative Python counts, then keep checking for three
+idle clocks that no level counting occurs.
+
+| Check | Count | Failures |
+|---|---|---|
+| Images (MNIST 0..3, all-zero, all-255) | 6 | 0 |
+| Time steps / step_done pulses / count pulses | 150 / 150 / 150 | 0 |
+| Cumulative count comparisons per step (incl. idle clocks) | 6,060 | 0 |
+| Final hardware counts vs Python | 60 | 0 |
+
+### Intentional breaks (all caught, then removed)
+
+| # | Mutant | Failures |
+|---|---|---|
+| 1 | counter index shifted by one | 31,384 |
+| 2 | output 9 not counted | 3,371 |
+| 3 | spike = 0 increments | 47,542 |
+| 4 | spike = 1 does not increment (neuron 6) | 2,983 |
+| 5 | `count_enable` ignored | 26,480 |
+| 6 | 4-bit counters | 1,112 |
+| 7 | only 24 pulses in the 25-pulse test | 30 |
+| 8 | 26 pulses in the 25-pulse test | 30 |
+| 9 | clear skips counter 5 | 4,527 |
+| 10 | count wins over clear | 14,355 |
+
+(Mutants 7 and 8 mutate the testbench pulse count, not the RTL. They first appeared to pass
+because the simulator was still loading the unmutated testbench from the default library; they
+were rerun against the mutated testbench and caught.)
+
 # Open Items (to resolve before RTL)
 
 1. Target FPGA device and BRAM capacity (~100 RAMB36 needed). **Open.**
