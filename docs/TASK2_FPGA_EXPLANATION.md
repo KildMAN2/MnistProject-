@@ -1938,6 +1938,86 @@ idle clocks that no level counting occurs.
 because the simulator was still loading the unmutated testbench from the default library; they
 were rerun against the mutated testbench and caught.)
 
+# RTL Milestone 11 — Argmax and Prediction
+
+Files: `fpga/rtl/argmax10.sv`, `fpga/scripts/generate_argmax_vectors.py`, `fpga/tb/tb_argmax10.sv`,
+vector file `argmax_vec.txt`. The global controller and `snn_top` are NOT part of this milestone.
+
+## What it does
+
+The classification rule of the golden `Int16SNN` is `prediction = argmax(counts)`, where
+`counts[k]` is the number of Layer-2 output spikes of neuron k over 25 steps. `argmax10` takes the
+ten 5-bit counts and outputs `predicted_digit[3:0]` (0..9) and, for debugging, `max_count[4:0]`.
+
+```
+counts[0] ----
+counts[1] -----
+counts[2] ------
+...              >---- argmax10 ----> predicted_digit[3:0]  (+ max_count[4:0])
+counts[9] ------/
+
+Tie:  counts[2] = 9, counts[5] = 9   ->   prediction = 2
+```
+
+## Implementation
+
+- Purely combinational (`always_comb`, complete default assignments, no latch, no clock, no register).
+- Reference structure: a scan in increasing index order, i.e. a combinational chain of 9 comparators
+  (`counts[1..9]` against the running best). A comparator tree could reduce depth later if timing
+  requires it; the scan is the clearest correctness reference.
+- Rule: `best = counts[0], index = 0; for k = 1..9: if (counts[k] > best) ...` with strict `>`.
+  An equal count never replaces the earlier index, so ties choose the LOWEST index, exactly like
+  `np.argmax` and `torch.argmax`. `>=` would choose the highest index and is wrong.
+- All-zero counts: all ten tie, the prediction is 0.
+- Input stability: the output follows the inputs combinationally, so the future controller must
+  sample `predicted_digit` only after all 25 count pulses are complete.
+
+## Golden vectors and ModelSim result
+
+`generate_argmax_vectors.py` regenerates the real counts from the REAL `Int16SNN`
+(`quantized_spike_counts(model(x))`; MNIST 0..19, all-zero, all-255), cross-checks them against
+`oc_final.txt`, and uses `np.argmax` as the oracle for directed and 50,000 random vectors
+(uniform, rounded normal, sparse, duplicated maximum, all equal, two-way top tie; 35,292 of the
+50,106 vectors have a tie for the maximum). The real predictions match the MNIST labels for
+20/20 images (informational; the golden target is Int16SNN).
+
+| Check | Count | Failures |
+|---|---|---|
+| Real image count vectors (MNIST 0..19, all-zero, all-255) | 22 | 0 |
+| Directed vectors (zero, unique max at each output, ties 0/9, 2/5, 1/4/8, all equal, 25s, ascending, descending, every two-way tie) | 84 | 0 |
+| Random vectors (counts 0..25) | 50,000 | 0 |
+| Vectors with a tie for the maximum | 35,292 | 0 |
+| Direct special checks (2/5 tie -> 2, all-255 counts, spec example, all-zero -> 0, ...) | 8 | 0 |
+| Total comparisons on the vectors (prediction + `max_count`) | 100,212 | 0 |
+| Counter + argmax integration: images / count pulses / predictions vs `oc_final` | 22 / 550 / 22 | 0 |
+| Integration final count comparisons | 220 | 0 |
+
+Real all-255 tie regression: counts `[0,0,9,6,0,9,0,6,0,0]` -> hardware prediction 2 = Int16SNN.
+Total mismatches: 0.
+
+### Counter + argmax integration
+
+`output_spike_counters` feeds `argmax10` directly. For each of the 22 images: clear, 25 one-clock
+count pulses with the real output spikes, then the prediction is sampled and compared with the
+Int16SNN prediction exported in `oc_final.txt` (and the counts and `max_count` too).
+
+### Intentional breaks (all caught, then removed)
+
+| # | Mutant | Failures |
+|---|---|---|
+| 1 | `>=` instead of `>` | 35,300 |
+| 2 | scan starts from output 1 (index 2 first compared) | 8,918 |
+| 3 | output 9 never considered | 2,925 |
+| 4 | predicted index +1 | 32,119 |
+| 5 | only low 4 bits of count compared | 45,224 |
+| 6 | minimum instead of maximum | 83,586 |
+| 7 | output 9 wins ties | 16,604 |
+| 8 | all-zero case predicts nonzero | 339 |
+| 9 | `max_count` wrong, index correct | 38,707 |
+| 10 | stale/latched prediction (holds when `counts[0] != counts[1]`) | 10,920 |
+
+Mutant 7 is a tie rule that prefers the highest index only for output 9.
+
 # Open Items (to resolve before RTL)
 
 1. Target FPGA device and BRAM capacity (~100 RAMB36 needed). **Open.**
@@ -1955,6 +2035,7 @@ were rerun against the mutated testbench and caught.)
    DSP-pipelined). **Open.**
 7. Simulator: ModelSim is the current simulator. **Resolved.**
 8. Beta is hard-coded as 19/20. Accepted.
-9. Add an argmax tie test vector. **Open.**
+9. Add an argmax tie test vector. **RESOLVED — Milestone 11** (the real all-255 image and
+   directed tie cases verify the lowest-index tie rule).
 10. (Resolved) The repository reorganization and the LIF correction are on `origin/main`.
 
