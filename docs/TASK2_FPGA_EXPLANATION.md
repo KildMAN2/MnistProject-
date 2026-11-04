@@ -2018,6 +2018,79 @@ Int16SNN prediction exported in `oc_final.txt` (and the counts and `max_count` t
 
 Mutant 7 is a tie rule that prefers the highest index only for output 9.
 
+# RTL Milestone 12 — Global Inference Controller
+
+`snn_inference_controller.sv` (control only) sequences the 25-step inference.
+`snn_inference_core.sv` wires it to `l1_current_sweep`, `l1_lif_sweep`,
+`l2_current_engine`, `l2_lif_sweep`, `output_spike_counters` and `argmax10`.
+The only inference command is `start`; pixels are loaded beforehand through the
+pixel-buffer write port.
+
+## State machine
+
+```
+IDLE -start-> L1C_KICK -> L1C_WAIT(l1_current_done)
+  -> CLR_KICK (l1_clear_state + l2_clear_state + clear_counts, 1 clock)
+  -> CLR_WAIT (both clear_done pulses, the first one is remembered)
+  -> for timestep = 0..24:
+       L1S_KICK -> L1S_WAIT(l1_step_done)
+       L2C_KICK -> L2C_WAIT(l2_current_done)
+       L2L_KICK -> L2L_WAIT(l2_step_done)
+       COUNT (count_enable, 1 clock; timestep++ unless timestep == 24)
+  -> FINALIZE (predicted_digit <= argmax, done <= 1) -> IDLE
+```
+
+13 states. All start/clear/count outputs are one-clock Moore pulses. Layer-1
+currents are computed once per image and cached, so the 25 steps only re-read
+`cur1`. `start` is ignored while busy. `rst` aborts to IDLE with no `done` pulse.
+
+## Why FINALIZE follows the 25th count edge
+
+On the COUNT edge the counters update with nonblocking assignments. If
+`predicted_digit` were captured on that same edge it would register the argmax of
+the counts from before the 25th step (stale by one step). FINALIZE is one clock
+later, when the counters already hold the final values and the combinational
+`argmax10` sees them.
+
+## Verification
+
+Golden vectors come from the real `Int16SNN` (22 images, 25 steps): pixels,
+`cur1`, hidden spikes, `cur2`, per-step output spikes and cumulative counts, and
+final counts and prediction. `tb_snn_inference_core.sv` checks the pulse counts,
+their ordering, timestep order, every cumulative count, the final counts and the
+prediction. It also checks start-while-busy, A→B→A transitions and reset during
+Layer-1 current, at timestep 10 and at timestep 24.
+
+Result: 28 complete inferences, 700 steps, 7,340 cumulative-count comparisons,
+280 final-count comparisons, 28 prediction comparisons, 0 failures. The all-255
+image gives counts `[0,0,9,6,0,9,0,6,0,0]` and prediction 2 (tie of outputs 2 and
+5, lowest index wins).
+
+Latency (accepted start to `done`): 279,708 clocks, constant for every inference
+(hypothetically 2.80 ms at 100 MHz; no timing closure has been done).
+
+## Intentional-break results
+
+| # | Mutant | Result |
+|---|---|---|
+| 1 | 24 steps | caught (reset-at-t=24 never reached; watchdog) |
+| 2 | 26 steps | 50 failures |
+| 3 | no Layer-1 clear | 9,502 |
+| 4 | no Layer-2 clear | 1,604 |
+| 5 | no counter clear | 5,629 |
+| 6 | Layer-2 current before `l1_step_done` | 1,546 |
+| 7 | skip one Layer-2 current run | 7,130 |
+| 8 | double count one step | 4,077 |
+| 9 | no count at t=24 | 54 |
+| 10 | prediction captured on COUNT edge | 2 |
+| 11 | timestep increments early | caught (watchdog) |
+| 12 | start accepted while busy | 679 |
+| 13 | cur1 recomputed every step | caught (watchdog, pulse counts) |
+| 14 | done asserted early | 54 |
+
+Mutants 1, 11 and 13 were caught by the testbench watchdog rather than by a
+failure count.
+
 # Open Items (to resolve before RTL)
 
 1. Target FPGA device and BRAM capacity (~100 RAMB36 needed). **Open.**
