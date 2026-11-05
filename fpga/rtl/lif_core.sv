@@ -45,11 +45,8 @@ module lif_core #(
 
   // ---- explicit sign extension of the current -------------------------------
   logic signed [MEM_WIDTH-1:0] cur_ext;
-  if (CUR_WIDTH == MEM_WIDTH) begin : g_cur_same
-    assign cur_ext = current_in;
-  end else begin : g_cur_ext
-    assign cur_ext = {{(MEM_WIDTH - CUR_WIDTH) {current_in[CUR_WIDTH-1]}}, current_in};
-  end
+  // current_in is signed, so plain assignment sign-extends (CUR_WIDTH <= MEM_WIDTH).
+  assign cur_ext = current_in;
 
   // ---- previous reset: compares the STORED membrane (not decayed/base) ------
   logic prev_reset;
